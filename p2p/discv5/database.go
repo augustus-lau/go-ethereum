@@ -368,12 +368,18 @@ seek:
 }
 
 func (db *nodeDB) fetchTopicRegTickets(id NodeID) (issued, used uint32) {
+	//key的结构  n:nodeid:tickets
 	key := makeKey(id, nodeDBTopicRegTickets)
+
+	//获取到key对应的值
 	blob, _ := db.lvl.Get(key, nil)
 	if len(blob) != 8 {
 		return 0, 0
 	}
+	//获取高四位 发布的版本号 -- 这表示什么
 	issued = binary.BigEndian.Uint32(blob[0:4])
+
+	//获取低四位 历史适用的 -- 这表示什么
 	used = binary.BigEndian.Uint32(blob[4:8])
 	return
 }

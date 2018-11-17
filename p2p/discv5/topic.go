@@ -28,31 +28,44 @@ import (
 )
 
 const (
-	maxEntries         = 10000
-	maxEntriesPerTopic = 50
+	/* 本地最多缓存 的 节点订阅topic的数量 */
+	maxEntries = 10000 //最大1w个数量
 
-	fallbackRegistrationExpiry = 1 * time.Hour
+	/* 每个topic最多可以被 订阅的数量，这决定了广播的性能 */
+	maxEntriesPerTopic = 50 //每个topic中最大包含的数量
+
+	fallbackRegistrationExpiry = 1 * time.Hour //注册过期时间
 )
 
+// 主题
 type Topic string
 
+//如果接收到多个请求时，一个请求就是一个topicEntry
 type topicEntry struct {
-	topic   Topic
-	fifoIdx uint64
-	node    *Node
-	expire  mclock.AbsTime
+	topic   Topic          // 主题 字符串
+	fifoIdx uint64         // 当节点订阅了多个topic后，该topic的优先级
+	node    *Node          // 发布该topic的节点
+	expire  mclock.AbsTime // 过期时间
 }
 
+/* 这里可以理解为：某个主题 被其他节点订阅的信息  */
 type topicInfo struct {
-	entries            map[uint64]*topicEntry
-	fifoHead, fifoTail uint64
-	rqItem             *topicRequestQueueItem
+	/* k/v形式    订阅该topic的节点优先级：订阅该topic的节点 */
+	/* 这里按照先订阅，后订阅维护顺序，维护本地节点所订阅的所有topic */
+	entries            map[uint64]*topicEntry // 那么它的索引就是最小的0，最后订阅的优先级是最后。
+	fifoHead, fifoTail uint64                 // 指向entries数组的 头尾指针
+	rqItem             *topicRequestQueueItem // 请求的内容实体
 	wcl                waitControlLoop
 }
 
 // removes tail element from the fifo
+// 从所有注册的节点中，删除掉最后一个
 func (t *topicInfo) getFifoTail() *topicEntry {
+
+	/* 如果末尾对应的topic 为空 */
 	for t.entries[t.fifoTail] == nil {
+
+		/* 我为为什么要+1，因为这里是先进先出的 */
 		t.fifoTail++
 	}
 	tail := t.entries[t.fifoTail]
@@ -60,28 +73,48 @@ func (t *topicInfo) getFifoTail() *topicEntry {
 	return tail
 }
 
+/* 集群中一个节点的信息。比如拿当前节点来说应该包含如下内容 */
 type nodeInfo struct {
-	entries                          map[Topic]*topicEntry
-	lastIssuedTicket, lastUsedTicket uint32
+
+	/* 每个topic 所对应的 主题内容(包含topic的过期时间，优先级，谁发布的) */
+	entries map[Topic]*topicEntry
+
+	lastIssuedTicket, lastUsedTicket uint32 //最新的发布时间，最新的适用某节点的时间
 	// you can't register a ticket newer than lastUsedTicket before noRegUntil (absolute time)
-	noRegUntil mclock.AbsTime
+	noRegUntil mclock.AbsTime //超时时间
 }
 
+/* 一个节点 既能发布主题，也能订阅主题，这里该怎么区分呢？？？？ */
 type topicTable struct {
-	db                    *nodeDB
-	self                  *Node
-	nodes                 map[*Node]*nodeInfo
-	topics                map[Topic]*topicInfo
-	globalEntries         uint64
-	requested             topicRequestQueue
-	requestCnt            uint64
+	/* 数据库 */
+	db *nodeDB
+	/* 自己 */
+	self *Node
+	/* 没个节点所订阅的主题 */
+	nodes map[*Node]*nodeInfo
+	/* 统计集群中，所有topic 被订阅的情况 */
+	topics map[Topic]*topicInfo
+
+	/* 有多少topic对象 */
+	globalEntries uint64
+
+	/* topic被订阅的 数量  */
+	requested topicRequestQueue
+
+	/* 全部节点的数量，表示如果有消息，则要发送给全部订阅节点的数量 */
+	requestCnt uint64
+
+	/* 最新回收时间 */
 	lastGarbageCollection mclock.AbsTime
 }
 
+/* 创建一个空的topic表 */
 func newTopicTable(db *nodeDB, self *Node) *topicTable {
 	if printTestImgLogs {
 		fmt.Printf("*N %016x\n", self.sha[:8])
 	}
+
+	/* 创建一个topic表 */
 	return &topicTable{
 		db:     db,
 		nodes:  make(map[*Node]*nodeInfo),
@@ -90,23 +123,33 @@ func newTopicTable(db *nodeDB, self *Node) *topicTable {
 	}
 }
 
+/* 去订阅topic 主题 */
 func (t *topicTable) getOrNewTopic(topic Topic) *topicInfo {
+
+	/* 查看有没有订阅该主题 */
 	ti := t.topics[topic]
+
+	//如果topic缓存中没有，则创建从请求的队列中创建一个
 	if ti == nil {
+		// 该订阅号 对应的推送消息 队列
 		rqItem := &topicRequestQueueItem{
 			topic:    topic,
 			priority: t.requestCnt,
 		}
+
 		ti = &topicInfo{
 			entries: make(map[uint64]*topicEntry),
 			rqItem:  rqItem,
 		}
 		t.topics[topic] = ti
+
+		//将rqItem放到堆缓存中
 		heap.Push(&t.requested, rqItem)
 	}
 	return ti
 }
 
+/* 当前节点取消主题 topic的订阅 */
 func (t *topicTable) checkDeleteTopic(topic Topic) {
 	ti := t.topics[topic]
 	if ti == nil {
@@ -118,14 +161,22 @@ func (t *topicTable) checkDeleteTopic(topic Topic) {
 	}
 }
 
+/* 获取node节点发布的所有主题 */
 func (t *topicTable) getOrNewNode(node *Node) *nodeInfo {
+
+	/* 获取该节点所发布的所有主题 */
 	n := t.nodes[node]
 	if n == nil {
 		//fmt.Printf("newNode %016x %016x\n", t.self.sha[:8], node.sha[:8])
 		var issued, used uint32
+
+		//如果db已经连接，则根据nodeId查找 相应的已发布的版本号 和 已经使用的版本号
 		if t.db != nil {
+			/* 获取该节点最近一次ticket的发布时间，和 最近一次的使用时间 */
 			issued, used = t.db.fetchTopicRegTickets(node.ID)
 		}
+
+		// 构建nodeInfo,存储该节点中的topic
 		n = &nodeInfo{
 			entries:          make(map[Topic]*topicEntry),
 			lastIssuedTicket: issued,
@@ -143,62 +194,85 @@ func (t *topicTable) checkDeleteNode(node *Node) {
 	}
 }
 
+/* 将node的 主题的 发布信息保存到db中 */
+/* ticket 其实代表的就是 一种订阅类型的 开始正式可适用的时间。就像入场券一样，订阅类型正式开始使用 */
 func (t *topicTable) storeTicketCounters(node *Node) {
 	n := t.getOrNewNode(node)
+
+	/* 注册node的所有topic，更新有效期。代表这可以正式使用了 */
 	if t.db != nil {
 		t.db.updateTopicRegTickets(node.ID, n.lastIssuedTicket, n.lastUsedTicket)
 	}
 }
 
+/* 从主题表中 获取订阅该topic的 所有节点 */
 func (t *topicTable) getEntries(topic Topic) []*Node {
 	t.collectGarbage()
 
+	/* 获取该topic 被其他节点订阅的信息 */
 	te := t.topics[topic]
 	if te == nil {
 		return nil
 	}
+
+	/* 保存集群中 订阅该主题的 节点*/
 	nodes := make([]*Node, len(te.entries))
 	i := 0
+
+	/* 提取订阅了该主题的其他节点 */
 	for _, e := range te.entries {
 		nodes[i] = e.node
 		i++
 	}
+	/* 这个参数好奇怪，查询一次这个接口，就加一次 */
 	t.requestCnt++
+
+	/* 更新待发送的消息队列 */
 	t.requested.update(te.rqItem, t.requestCnt)
 	return nodes
 }
 
+/* node节点 订阅topic */
 func (t *topicTable) addEntry(node *Node, topic Topic) {
+
+	/* 获取节点node所发布的所有订阅号 */
 	n := t.getOrNewNode(node)
+
 	// clear previous entries by the same node
+	/* 清空该节点所发布的订阅号的 所有超时时间等，但订阅号不删 */
 	for _, e := range n.entries {
 		t.deleteEntry(e)
 	}
-	// ***
+	// 这里有执行一遍，表示创建一个新的。。写的太无语了
 	n = t.getOrNewNode(node)
 
 	tm := mclock.Now()
+
+	/* 获取该topic被订阅的 节点 */
 	te := t.getOrNewTopic(topic)
 
+	/* 如果满足等于每个topic被订阅的最大值，则删除掉尾部的数据 */
 	if len(te.entries) == maxEntriesPerTopic {
 		t.deleteEntry(te.getFifoTail())
 	}
-
+	/* 如果本地保存的 所有的订阅关系 已经到最大了 */
 	if t.globalEntries == maxEntries {
 		t.deleteEntry(t.leastRequested()) // not empty, no need to check for nil
 	}
-
+	/* 移动指针 */
 	fifoIdx := te.fifoHead
 	te.fifoHead++
+
 	entry := &topicEntry{
-		topic:   topic,
-		fifoIdx: fifoIdx,
-		node:    node,
-		expire:  tm + mclock.AbsTime(fallbackRegistrationExpiry),
+		topic:   topic,                                           //订阅的主题
+		fifoIdx: fifoIdx,                                         //上一个被订阅的数据
+		node:    node,                                            //订阅者
+		expire:  tm + mclock.AbsTime(fallbackRegistrationExpiry), //过期时间 = 当前时间+监听时间
 	}
 	if printTestImgLogs {
 		fmt.Printf("*+ %d %v %016x %016x\n", tm/1000000, topic, t.self.sha[:8], node.sha[:8])
 	}
+	/* 将索引执行新订阅的 节点数据 */
 	te.entries[fifoIdx] = entry
 	n.entries[topic] = entry
 	t.globalEntries++
@@ -235,6 +309,7 @@ func (t *topicTable) deleteEntry(e *topicEntry) {
 }
 
 // It is assumed that topics and waitPeriods have the same length.
+/* 注册该节点发布的主题，返回是否注册成功 */
 func (t *topicTable) useTicket(node *Node, serialNo uint32, topics []Topic, idx int, issueTime uint64, waitPeriods []uint32) (registered bool) {
 	log.Trace("Using discovery ticket", "serial", serialNo, "topics", topics, "waits", waitPeriods)
 	//fmt.Println("useTicket", serialNo, topics, waitPeriods)
@@ -249,6 +324,8 @@ func (t *topicTable) useTicket(node *Node, serialNo uint32, topics []Topic, idx 
 	if serialNo > n.lastUsedTicket && tm < n.noRegUntil {
 		return false
 	}
+
+	/* 也就是说 当前时间 >= n.noRegUntil */
 	if serialNo != n.lastUsedTicket {
 		n.lastUsedTicket = serialNo
 		n.noRegUntil = tm + mclock.AbsTime(noRegTimeout())
@@ -271,28 +348,45 @@ func (t *topicTable) useTicket(node *Node, serialNo uint32, topics []Topic, idx 
 	return false
 }
 
+/**
+ * 要想将发布的主题 注册，必须要一个门票才能注册，这个门票其实就是一个递增的序列号。
+ * 只有拿到这个门票，才能将主题 注册到数据库中。这个方法就是 产生门票的方法。用该门票调用useTicket方法去注册这些主题。之后才能使用
+ * @param node   要发布主题的节点
+ * @param topics 要发布的主题
+ * @ticket  入场券(发布序号或者注册序号)
+ */
 func (topictab *topicTable) getTicket(node *Node, topics []Topic) *ticket {
+
+	/* 回收过期的主题 */
 	topictab.collectGarbage()
 
 	now := mclock.Now()
+	//获取或者创建一个新的节点
 	n := topictab.getOrNewNode(node)
+
+	/* topic表中，没次发布都会产生一个自增长的序号。代表的是主题发布的次数 */
 	n.lastIssuedTicket++
+
+	/* 发布入场券(也就是更新一次node节点所发布的所有订阅号的有效期) */
 	topictab.storeTicketCounters(node)
 
 	t := &ticket{
-		issueTime: now,
-		topics:    topics,
-		serial:    n.lastIssuedTicket,
-		regTime:   make([]mclock.AbsTime, len(topics)),
+		issueTime: now,                                 //节点的发布时间(数据库到内存)
+		topics:    topics,                              //节点所订阅的所有topic
+		serial:    n.lastIssuedTicket,                  //该节点第几次从数据库到内存发布
+		regTime:   make([]mclock.AbsTime, len(topics)), //所有主题的注册时间
 	}
+
+	//遍历该节点订阅的topic
 	for i, topic := range topics {
-		var waitPeriod time.Duration
+		var waitPeriod time.Duration //订阅的等待周期
 		if topic := topictab.topics[topic]; topic != nil {
-			waitPeriod = topic.wcl.waitPeriod
+			waitPeriod = topic.wcl.waitPeriod //该订阅消息的 每次轮询的周期
 		} else {
-			waitPeriod = minWaitPeriod
+			waitPeriod = minWaitPeriod //在本地中没有找到该订阅消息的刷新周期，那么设置为最小的刷新周期
 		}
 
+		// 订阅消息的 注册时间就是 当前时间+刷新周期
 		t.regTime[i] = now + mclock.AbsTime(waitPeriod)
 	}
 	return t
@@ -323,8 +417,8 @@ func (t *topicTable) collectGarbage() {
 }
 
 const (
-	minWaitPeriod   = time.Minute
-	regTimeWindow   = 10 // seconds
+	minWaitPeriod   = time.Minute //订阅消息是1分钟刷新一次
+	regTimeWindow   = 10          // seconds
 	avgnoRegTimeout = time.Minute * 10
 	// target average interval between two incoming ad requests
 	wcTargetRegInterval = time.Minute * 10 / maxEntriesPerTopic

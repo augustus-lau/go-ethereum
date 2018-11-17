@@ -58,7 +58,7 @@ const (
 
 // RPC packet types
 const (
-	pingPacket = iota + 1 // zero is 'reserved'
+	pingPacket = iota + 1 // zero is 'reserved'  //初始化为1  iota 是初始化零标识符
 	pongPacket
 	findnodePacket
 	neighborsPacket
@@ -67,9 +67,9 @@ const (
 // RPC request structures
 type (
 	ping struct {
-		Version    uint
-		From, To   rpcEndpoint
-		Expiration uint64
+		Version    uint        //当前的udp的版本号
+		From, To   rpcEndpoint // 来源 去处
+		Expiration uint64      //ping的过期时间
 		// Ignore additional fields (for forward compatibility).
 		Rest []rlp.RawValue `rlp:"tail"`
 	}
@@ -79,8 +79,9 @@ type (
 		// This field should mirror the UDP envelope address
 		// of the ping packet, which provides a way to discover the
 		// the external address (after NAT).
-		To rpcEndpoint
+		To rpcEndpoint //响应给谁
 
+		//由于ping /pong 必须一一对应，故这里 包含了ping过来是 数据的 hash值
 		ReplyTok   []byte // This contains the hash of the ping packet.
 		Expiration uint64 // Absolute timestamp at which the packet becomes invalid.
 		// Ignore additional fields (for forward compatibility).
@@ -156,6 +157,7 @@ type conn interface {
 	LocalAddr() net.Addr
 }
 
+// udp为什么实现rpc协议
 // udp implements the RPC protocol.
 type udp struct {
 	conn        conn
@@ -164,10 +166,10 @@ type udp struct {
 	ourEndpoint rpcEndpoint
 
 	addpending chan *pending
-	gotreply   chan reply
+	gotreply   chan reply //
 
-	closing chan struct{}
-	nat     nat.Interface
+	closing chan struct{} // 关闭通道
+	nat     nat.Interface //nat网络
 
 	*Table
 }
@@ -183,17 +185,17 @@ type udp struct {
 // to all the callback functions for that node.
 type pending struct {
 	// these fields must match in the reply.
-	from  NodeID
-	ptype byte
+	from  NodeID //来源节点的id
+	ptype byte   //数据包的类型
 
 	// time when the request must complete
-	deadline time.Time
+	deadline time.Time //超时时间点
 
 	// callback is called when a matching reply arrives. if it returns
 	// true, the callback is removed from the pending reply queue.
 	// if it returns false, the reply is considered incomplete and
 	// the callback will be invoked again for the next matching reply.
-	callback func(resp interface{}) (done bool)
+	callback func(resp interface{}) (done bool) // 如果udp的请求需要回复，这调用该接口回复
 
 	// errc receives nil when the callback indicates completion or an
 	// error if no further reply is received within the timeout.
@@ -201,14 +203,15 @@ type pending struct {
 }
 
 type reply struct {
-	from  NodeID
-	ptype byte
-	data  interface{}
+	from  NodeID      //来源
+	ptype byte        //响应类型
+	data  interface{} //数据
 	// loop indicates whether there was
 	// a matching request by sending on this channel.
 	matched chan<- bool
 }
 
+//当对方发过来一个只读包时(不需要回复的)，就封装成ReadPacket
 // ReadPacket is sent to the unhandled channel when it could not be processed
 type ReadPacket struct {
 	Data []byte
@@ -221,11 +224,13 @@ type Config struct {
 	PrivateKey *ecdsa.PrivateKey
 
 	// These settings are optional:
-	AnnounceAddr *net.UDPAddr      // local address announced in the DHT
-	NodeDBPath   string            // if set, the node database is stored at this filesystem location
-	NetRestrict  *netutil.Netlist  // network whitelist
-	Bootnodes    []*Node           // list of bootstrap nodes
-	Unhandled    chan<- ReadPacket // unhandled packets are sent on this channel
+	AnnounceAddr *net.UDPAddr     // local address announced in the DHT
+	NodeDBPath   string           // if set, the node database is stored at this filesystem location
+	NetRestrict  *netutil.Netlist // network whitelist  //黑名单
+	Bootnodes    []*Node          // list of bootstrap nodes  //守护节点
+
+	//无需回复通道，为什么要放到路由配置中，，难道只有路由表信息的请求才会用该通道的数据么
+	Unhandled chan<- ReadPacket // unhandled packets are sent on this channel
 }
 
 // ListenUDP returns a new table that listens for UDP packets on laddr.
@@ -238,28 +243,35 @@ func ListenUDP(c conn, cfg Config) (*Table, error) {
 	return tab, nil
 }
 
+// 对udp进行封装， 原有的udp句柄只是一个读取数据的对象
+// 这里对udp封装，主要是增加udp的 控制并发的能力 和 加密方式，采用通道的方式来解决
 func newUDP(c conn, cfg Config) (*Table, *udp, error) {
 	udp := &udp{
 		conn:        c,
 		priv:        cfg.PrivateKey,
 		netrestrict: cfg.NetRestrict,
-		closing:     make(chan struct{}),
-		gotreply:    make(chan reply),
-		addpending:  make(chan *pending),
+		closing:     make(chan struct{}), //接受udp服务停止信号量
+		gotreply:    make(chan reply),    //保存 正在等待别人给我的回复
+		addpending:  make(chan *pending), //当向外发送了消息，但是尚未接收到回复的 请求
 	}
 	realaddr := c.LocalAddr().(*net.UDPAddr)
 	if cfg.AnnounceAddr != nil {
 		realaddr = cfg.AnnounceAddr
 	}
-	// TODO: separate TCP port
+	// TODO: separate TCP port  //生成udp的rpc结构体
 	udp.ourEndpoint = makeEndpoint(realaddr, uint16(realaddr.Port))
+
 	tab, err := newTable(udp, PubkeyID(&cfg.PrivateKey.PublicKey), realaddr, cfg.NodeDBPath, cfg.Bootnodes)
 	if err != nil {
 		return nil, nil, err
 	}
 	udp.Table = tab
 
+	// 起线程 不断刷新路由表
 	go udp.loop()
+
+	// 起协程 接受udp 所有请求 ----- 这里就是udp接受所有请求的开始
+	// 将udp接受到的数据 全部放入到了Unhandled通道中(无需回复通道)
 	go udp.readLoop(cfg.Unhandled)
 	return udp.Table, udp, nil
 }
@@ -333,11 +345,16 @@ func (t *udp) pending(id NodeID, ptype byte, callback func(interface{}) bool) <-
 	return ch
 }
 
+//处理从nodeid 过来的回复消息---阻塞
 func (t *udp) handleReply(from NodeID, ptype byte, req packet) bool {
 	matched := make(chan bool, 1)
+
 	select {
+	//首先构造一个回复的结构体，并放入到reply通道中
 	case t.gotreply <- reply{from, ptype, req, matched}:
 		// loop will handle it
+
+		//阻塞，直到返回成功。如果该通道中一直为空，则一直阻塞。返回false,就一定需要将该节点加入到本地路由表中
 		return <-matched
 	case <-t.closing:
 		return false
@@ -347,13 +364,18 @@ func (t *udp) handleReply(from NodeID, ptype byte, req packet) bool {
 // loop runs in its own goroutine. it keeps track of
 // the refresh timer and the pending reply queue.
 func (t *udp) loop() {
+
+	// 线程中的局部变量
 	var (
-		plist        = list.New()
-		timeout      = time.NewTimer(0)
-		nextTimeout  *pending // head of plist when timeout was last reset
-		contTimeouts = 0      // number of continuous timeouts to do NTP checks
-		ntpWarnTime  = time.Unix(0, 0)
+		plist = list.New() //线程本地缓存
+
+		timeout      = time.NewTimer(0) // 超时校验调度器
+		nextTimeout  *pending           // head of plist when timeout was last reset // 最新的一个即将超时的数据
+		contTimeouts = 0                // number of continuous timeouts to do NTP checks  已经超时的数据个数
+		ntpWarnTime  = time.Unix(0, 0)  // 多个节点间的时间差异 大于该值是发出警告
 	)
+
+	// 忽略第一个超时数据
 	<-timeout.C // ignore first timeout
 	defer timeout.Stop()
 
@@ -369,6 +391,8 @@ func (t *udp) loop() {
 				timeout.Reset(dist)
 				return
 			}
+
+			//删除已经超时的数据
 			// Remove pending replies whose deadline is too far in the
 			// future. These can occur if the system clock jumped
 			// backwards after the deadline was assigned.
@@ -379,22 +403,36 @@ func (t *udp) loop() {
 		timeout.Stop()
 	}
 
+	//开始循环
 	for {
+
+		// 每次循环重置时间
 		resetTimeout()
 
+		// 选择一个通道来相应数据，如果没有接收到消息 或者没有通道匹配 则退出
 		select {
 		case <-t.closing:
+
+			// 向所有节点的关闭通道中发送一个消息，关闭连接
 			for el := plist.Front(); el != nil; el = el.Next() {
 				el.Value.(*pending).errc <- errClosed
 			}
 			return
 
+		// 如果发起了一个udp请求，则添加到pending中
 		case p := <-t.addpending:
 			p.deadline = time.Now().Add(respTimeout)
 			plist.PushBack(p)
 
+		// gotreply，不是要给别人回复，而是正在等待 别人给我的答复
+		// 如果接受到了回复请求，则遍历所有的节点，-- 如果匹配到，确实是我正在等待的回复，则返回匹配成功。
 		case r := <-t.gotreply:
 			var matched bool
+
+			//plist 中放的是 本机主动发起的ping,
+			// 如果在plist中找到了对方节点的信息，说明本机是知道对方的地址信息的，所以返回true
+			// 如果在plist中没有找到对方节点的信息，说明这个回复 不是由对方节点主动发起的，而本地不一定存储了对方节点的信息，返回false
+			// 所以返回false 代表本机不一定知道对方节点的信息，如果返回false,就需要将该节点加入到本地路由表中
 			for el := plist.Front(); el != nil; el = el.Next() {
 				p := el.Value.(*pending)
 				if p.from == r.from && p.ptype == r.ptype {
@@ -411,8 +449,12 @@ func (t *udp) loop() {
 					contTimeouts = 0
 				}
 			}
+
+			// 如果不是本机主动发起的ping，这里就 返回未匹配到，代表不需要加入到路由表中
+			// 所有只有主动发起的ping才会加入到路由表中
 			r.matched <- matched
 
+		//如果超时
 		case now := <-timeout.C:
 			nextTimeout = nil
 
@@ -425,6 +467,7 @@ func (t *udp) loop() {
 					contTimeouts++
 				}
 			}
+			// 如果超时个数 太多，有可能是节点间的时间不一致，起线程 同步服务期间的时间
 			// If we've accumulated too many timeouts, do an NTP time sync check
 			if contTimeouts > ntpFailureThreshold {
 				if time.Since(ntpWarnTime) >= ntpWarningCooldown {
@@ -438,8 +481,12 @@ func (t *udp) loop() {
 }
 
 const (
-	macSize  = 256 / 8
-	sigSize  = 520 / 8
+	//mac地址大小占32个字节大小----- 这个保存packet的整个签名
+	macSize = 256 / 8
+	//签名大小占65个字节大小
+	sigSize = 520 / 8
+
+	//头的大小一共占  32+65 = 97个字节大小
 	headSize = macSize + sigSize // space of packet frame data
 )
 
@@ -469,6 +516,11 @@ func init() {
 	}
 }
 
+/**
+ * @param toaddr 目标地址
+ * @param ptype  消息类型(只有四种)
+ * @param req    数据包
+ */
 func (t *udp) send(toaddr *net.UDPAddr, ptype byte, req packet) ([]byte, error) {
 	packet, hash, err := encodePacket(t.priv, ptype, req)
 	if err != nil {
@@ -483,25 +535,52 @@ func (t *udp) write(toaddr *net.UDPAddr, what string, packet []byte) error {
 	return err
 }
 
+/**
+ * 对要发送的数据包进行编码和加密，，
+ * 1、这里不对原始数据进行加密，只对原始数据进行编码。估计是因为原始数据暴露出来其实不重要
+ * 2、udp的数据 只做了防篡改的签名加密操作
+ * @param priv  私钥
+ * @param ptype 类型
+ * @param req   传输的数据
+ *
+ */
 func encodePacket(priv *ecdsa.PrivateKey, ptype byte, req interface{}) (packet, hash []byte, err error) {
+
 	b := new(bytes.Buffer)
+
+	// 写入headspaced个空数组数据
 	b.Write(headSpace)
+	//写入一个字节的事件类型
 	b.WriteByte(ptype)
+	//首先对数据进行编码-- 类似json，采用rlp格式序列化数据
+	// 采用rlp对数据编码 并保存到b中
 	if err := rlp.Encode(b, req); err != nil {
 		log.Error("Can't encode discv4 packet", "err", err)
 		return nil, nil, err
 	}
+	// header + ptype
 	packet = b.Bytes()
+
+	// 首先对header后的所有数据做sha3的hash
+	// 然后采用私钥对 该hash加密 --- 注意这里是对hash值 加密得到 签名
 	sig, err := crypto.Sign(crypto.Keccak256(packet[headSize:]), priv)
+
 	if err != nil {
 		log.Error("Can't sign discv4 packet", "err", err)
 		return nil, nil, err
 	}
+
+	// 将签名写入  目前packet中  header + ptype +sig(签名)
 	copy(packet[macSize:], sig)
+
 	// add the hash to the front. Note: this doesn't protect the
 	// packet in any way. Our public key will be part of this hash in
 	// The future.
+	// 然后在对 sig+ptype+data 进行keccak做签名 --256
+	// 这里的mac是指h-mac 签名算法
 	hash = crypto.Keccak256(packet[macSize:])
+
+	//将该签名写入到packet的前几位
 	copy(packet, hash)
 	return packet, hash, nil
 }
@@ -515,8 +594,14 @@ func (t *udp) readLoop(unhandled chan<- ReadPacket) {
 	// Discovery packets are defined to be no larger than 1280 bytes.
 	// Packets larger than this size will be cut at the end and treated
 	// as invalid because their hash won't match.
+
+	//定义一个1280大小的缓冲,默认发现机制不允许超过1280
+	//如果超过，则认为无效
 	buf := make([]byte, 1280)
+
+	//无线循环读取-- 这里采用的是 阻塞模型- 并且是一个线程 一个个处理接受到的请求
 	for {
+		//数据大小，来源， 保存到buf中
 		nbytes, from, err := t.conn.ReadFromUDP(buf)
 		if netutil.IsTemporaryError(err) {
 			// Ignore temporary read errors.
@@ -527,6 +612,7 @@ func (t *udp) readLoop(unhandled chan<- ReadPacket) {
 			log.Debug("UDP read error", "err", err)
 			return
 		}
+		//将数据封装成 系统可以处理的数据结构
 		if t.handlePacket(from, buf[:nbytes]) != nil && unhandled != nil {
 			select {
 			case unhandled <- ReadPacket{buf[:nbytes], from}:
@@ -536,31 +622,51 @@ func (t *udp) readLoop(unhandled chan<- ReadPacket) {
 	}
 }
 
+/**
+ * @param from   udp接受到的数据来源ip-port
+ * @param from   udp接受到的数据
+ * 接受到消息后，处理该消息
+ */
 func (t *udp) handlePacket(from *net.UDPAddr, buf []byte) error {
+
+	// 对数据进行解码，解析出 数据包，来源节点的id, hash签名
 	packet, fromID, hash, err := decodePacket(buf)
 	if err != nil {
 		log.Debug("Bad discv4 packet", "addr", from, "err", err)
 		return err
 	}
+
 	err = packet.handle(t, from, fromID, hash)
 	log.Trace("<< "+packet.name(), "addr", from, "err", err)
 	return err
 }
 
+//对接收到的数据进行解码
 func decodePacket(buf []byte) (packet, NodeID, []byte, error) {
+
+	//校验头的大小 (header+type 尺寸)
 	if len(buf) < headSize+1 {
 		return nil, NodeID{}, nil, errPacketTooSmall
 	}
+
+	//签名，sig，和签名的数据---- ~32位     32~65位   65位~~
 	hash, sig, sigdata := buf[:macSize], buf[macSize:headSize], buf[headSize:]
+
+	//sha-3 对 sig+sigdata hash ，与之前的hash签名 比对，如果不同，则被篡改过
 	shouldhash := crypto.Keccak256(buf[macSize:])
 	if !bytes.Equal(hash, shouldhash) {
 		return nil, NodeID{}, nil, errBadHash
 	}
+
+	//从数据中解析出来源及其的nodeid
 	fromID, err := recoverNodeID(crypto.Keccak256(buf[headSize:]), sig)
+
 	if err != nil {
 		return nil, NodeID{}, hash, err
 	}
 	var req packet
+
+	// 从数据中国解析出请求类型，根据不同的类型，生成不同的数据包
 	switch ptype := sigdata[0]; ptype {
 	case pingPacket:
 		req = new(ping)
@@ -573,22 +679,38 @@ func decodePacket(buf []byte) (packet, NodeID, []byte, error) {
 	default:
 		return nil, fromID, hash, fmt.Errorf("unknown type: %d", ptype)
 	}
+
+	//创建一个数据流
 	s := rlp.NewStream(bytes.NewReader(sigdata[1:]), 0)
+
+	//用创建的数据流读入传递过来的数据，然后对数据进行解密
+	//这里的解密规则 采用了rlp协议来加密解密数据的
 	err = s.Decode(req)
 	return req, fromID, hash, err
 }
 
+//如果接受到的消息类型是ping，则调用该方法处理该消息
 func (req *ping) handle(t *udp, from *net.UDPAddr, fromID NodeID, mac []byte) error {
+
+	//校验该消息是否过期
 	if expired(req.Expiration) {
 		return errExpired
 	}
+
+	//发送一个pong包
 	t.send(from, pongPacket, &pong{
 		To:         makeEndpoint(from, req.From.TCP),
 		ReplyTok:   mac,
 		Expiration: uint64(time.Now().Add(expiration).Unix()),
 	})
+
+	//阻塞 --- 等待对方回复
+	// 这里是根据回复来判断是否需要加入到本地路由表，
+	// -- 这里返回一定是false,因为是主动连接本机，而本机中不一定存了对方的信息，所以一定要加入到本地表
 	if !t.handleReply(fromID, pingPacket, req) {
 		// Note: we're ignoring the provided IP address right now
+
+		//起一个县城，将该节点加入到路由表中
 		go t.bond(true, fromID, from, req.From.TCP)
 	}
 	return nil

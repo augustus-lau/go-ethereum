@@ -87,9 +87,18 @@ type MsgReadWriter interface {
 	MsgWriter
 }
 
+// rlp的递归长度前缀 算法，主要是讲data 按rlp算法编码成trie树
 // Send writes an RLP-encoded message with the given code.
 // data should encode as an RLP list.
+/**
+ * @param w         writer
+ * @param msgcode   状态码
+ * @param data      传递的数据
+ *
+ */
 func Send(w MsgWriter, msgcode uint64, data interface{}) error {
+
+	// 采用rlp对数据进行编码
 	size, r, err := rlp.EncodeToReader(data)
 	if err != nil {
 		return err

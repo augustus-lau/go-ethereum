@@ -114,11 +114,14 @@ func toECDSA(d []byte, strict bool) (*ecdsa.PrivateKey, error) {
 	return priv, nil
 }
 
+// 提取私钥，并保存为二进制
 // FromECDSA exports a private key into a binary dump.
 func FromECDSA(priv *ecdsa.PrivateKey) []byte {
 	if priv == nil {
 		return nil
 	}
+
+	//将私钥中的参数D转化为大端数据，32字节长度的大端私钥
 	return math.PaddedBigBytes(priv.D, priv.Params().BitSize/8)
 }
 
@@ -169,9 +172,12 @@ func LoadECDSA(file string) (*ecdsa.PrivateKey, error) {
 // restrictive permissions. The key data is saved hex-encoded.
 func SaveECDSA(file string, key *ecdsa.PrivateKey) error {
 	k := hex.EncodeToString(FromECDSA(key))
+
+	// 0600代表文件的权限
 	return ioutil.WriteFile(file, []byte(k), 0600)
 }
 
+//STEP-1 :  生成一个256长度的私钥 -- 并以私钥作为nodeKey
 func GenerateKey() (*ecdsa.PrivateKey, error) {
 	return ecdsa.GenerateKey(S256(), rand.Reader)
 }

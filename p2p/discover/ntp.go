@@ -41,6 +41,7 @@ func (s durationSlice) Len() int           { return len(s) }
 func (s durationSlice) Less(i, j int) bool { return s[i] < s[j] }
 func (s durationSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
+// 主要用于同步不同节点间的时间
 // checkClockDrift queries an NTP server for clock drifts and warns the user if
 // one large enough is detected.
 func checkClockDrift() {

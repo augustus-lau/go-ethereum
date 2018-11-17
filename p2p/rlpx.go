@@ -44,16 +44,24 @@ import (
 	"github.com/golang/snappy"
 )
 
+// RLP 编码/解码协议
+// RLPX 升级版
+// 这里要理解 为什么用rlp-x协议， 该协议有哪些优点
+// RLP 编码协议，就是葱粉利用第一个字节的存储空间，将0x7f以后的值赋予新的含义，
+// 以往我们见到的编码方式主要是对指定长度字节进行编码，比如Unicode等，
+// 在处理这些编码时一般按照指定长度进行拆分解码，最大的弊端是传统编码无法表现一个结构
+// RLP最大的优点是在充分利用字节的情况下，同时支持列表结构，也就是说可以很轻易的利用RLP存储一个树状结构
 const (
+	// 取反全是1，右移8位， 高8位变为0
 	maxUint24 = ^uint32(0) >> 8
 
-	sskLen = 16 // ecies.MaxSharedKeyLength(pubKey) / 2
-	sigLen = 65 // elliptic S256
-	pubLen = 64 // 512 bit pubkey in uncompressed representation without format byte
-	shaLen = 32 // hash length (for nonce etc)
+	sskLen = 16 // ecies.MaxSharedKeyLength(pubKey) / 2  --校验密钥是否和算法是否匹配，只有都符合条件了才能用于加密
+	sigLen = 65 // elliptic S256               椭圆加密算法签名长度
+	pubLen = 64 // 512 bit pubkey in uncompressed representation without format byte  公钥长度 2^64
+	shaLen = 32 // hash length (for nonce etc) hash值长度
 
-	authMsgLen  = sigLen + shaLen + pubLen + shaLen + 1
-	authRespLen = pubLen + shaLen + 1
+	authMsgLen  = sigLen + shaLen + pubLen + shaLen + 1 //授权信息的长度
+	authRespLen = pubLen + shaLen + 1                   //授权响应的长度
 
 	eciesOverhead = 65 /* pubkey */ + 16 /* IV */ + 32 /* MAC */
 
@@ -62,12 +70,12 @@ const (
 
 	// total timeout for encryption handshake and protocol
 	// handshake in both directions.
-	handshakeTimeout = 5 * time.Second
+	handshakeTimeout = 5 * time.Second //握手超时
 
 	// This is the timeout for sending the disconnect reason.
 	// This is shorter than the usual timeout because we don't want
 	// to wait if the connection is known to be bad anyway.
-	discWriteTimeout = 1 * time.Second
+	discWriteTimeout = 1 * time.Second //断开了解超时时间
 )
 
 // errPlainMessageTooLarge is returned if a decompressed message length exceeds
@@ -77,13 +85,14 @@ var errPlainMessageTooLarge = errors.New("message length >= 16MB")
 // rlpx is the transport protocol used by actual (non-test) connections.
 // It wraps the frame encoder with locks and read/write deadlines.
 type rlpx struct {
-	fd net.Conn
-
-	rmu, wmu sync.Mutex
-	rw       *rlpxFrameRW
+	fd       net.Conn     //封装的连接
+	rmu, wmu sync.Mutex   //读取、写入全局锁
+	rw       *rlpxFrameRW //输入输出流
 }
 
 func newRLPX(fd net.Conn) transport {
+
+	// 连接时长
 	fd.SetDeadline(time.Now().Add(handshakeTimeout))
 	return &rlpx{fd: fd}
 }
@@ -121,12 +130,19 @@ func (t *rlpx) close(err error) {
 	t.fd.Close()
 }
 
+/**
+ * 开始握手
+ * @param our 发送方的握手协议
+ * @param their  接收方的握手协议
+ * 加密信道已经创建完毕。我们看到这里只是约定了是否使用Snappy加密然后就退出了
+ */
 func (t *rlpx) doProtoHandshake(our *protoHandshake) (their *protoHandshake, err error) {
 	// Writing our handshake happens concurrently, we prefer
 	// returning the handshake read error. If the remote side
 	// disconnects us early with a valid reason, we should return it
 	// as the error so it can be tracked elsewhere.
 	werr := make(chan error, 1)
+	// 根据协议输入输出流，状态码，数据 发送握手协议
 	go func() { werr <- Send(t.rw, handshakeMsg, our) }()
 	if their, err = readProtocolHandshake(t.rw, our); err != nil {
 		<-werr // make sure the write terminates too
@@ -141,14 +157,17 @@ func (t *rlpx) doProtoHandshake(our *protoHandshake) (their *protoHandshake, err
 	return their, nil
 }
 
+//读取握手消息的内容
 func readProtocolHandshake(rw MsgReader, our *protoHandshake) (*protoHandshake, error) {
 	msg, err := rw.ReadMsg()
 	if err != nil {
 		return nil, err
 	}
+	//判断数据的大小
 	if msg.Size > baseProtocolMaxMsgSize {
 		return nil, fmt.Errorf("message too big")
 	}
+	//如果该消息是断开节点的消息-- 返回断开原因
 	if msg.Code == discMsg {
 		// Disconnect before protocol handshake is valid according to the
 		// spec and we send it ourself if the posthanshake checks fail.
@@ -158,9 +177,12 @@ func readProtocolHandshake(rw MsgReader, our *protoHandshake) (*protoHandshake, 
 		rlp.Decode(msg.Payload, &reason)
 		return nil, reason[0]
 	}
+
+	//如果不是握手消息
 	if msg.Code != handshakeMsg {
 		return nil, fmt.Errorf("expected handshake, got %x", msg.Code)
 	}
+	//读取消息内容的主体
 	var hs protoHandshake
 	if err := msg.Decode(&hs); err != nil {
 		return nil, err
@@ -171,6 +193,7 @@ func readProtocolHandshake(rw MsgReader, our *protoHandshake) (*protoHandshake, 
 	return &hs, nil
 }
 
+//加密消息握手
 // doEncHandshake runs the protocol handshake using authenticated
 // messages. the protocol handshake is the first authenticated message
 // and also verifies whether the encryption handshake 'worked' and the
@@ -180,9 +203,10 @@ func (t *rlpx) doEncHandshake(prv *ecdsa.PrivateKey, dial *discover.Node) (disco
 		sec secrets
 		err error
 	)
+	//如果发送消息的主题是空的，则从加密信息中获取到发送源
 	if dial == nil {
 		sec, err = receiverEncHandshake(t.fd, prv, nil)
-	} else {
+	} else { //如果不为空，则验证
 		sec, err = initiatorEncHandshake(t.fd, prv, dial.ID, nil)
 	}
 	if err != nil {
@@ -237,6 +261,9 @@ type authRespV4 struct {
 	Rest []rlp.RawValue `rlp:"tail"`
 }
 
+// 最后是secrets函数，这个函数是在handshake完成之后调用。
+// 它通过自己的随机私钥和对端的公钥来生成一个共享秘密,这个共享秘密是瞬时的(只在当前这个链接中存在)。
+// 所以当有一天私钥被破解。 之前的消息还是安全的
 // secrets is called after the handshake is completed.
 // It extracts the connection secrets from the handshake values.
 func (h *encHandshake) secrets(auth, authResp []byte) (secrets, error) {
@@ -261,6 +288,8 @@ func (h *encHandshake) secrets(auth, authResp []byte) (secrets, error) {
 	mac2 := sha3.NewKeccak256()
 	mac2.Write(xor(s.MAC, h.initNonce))
 	mac2.Write(authResp)
+
+	// 收到的每个包都会检查其MAC值是否满足计算的结果。如果不满足说明有问题。
 	if h.initiator {
 		s.EgressMAC, s.IngressMAC = mac1, mac2
 	} else {
@@ -276,6 +305,9 @@ func (h *encHandshake) staticSharedSecret(prv *ecdsa.PrivateKey) ([]byte, error)
 	return ecies.ImportECDSA(prv).GenerateShared(h.remotePub, sskLen, sskLen)
 }
 
+// 首先看看链接的发起者的操作。首先通过makeAuthMsg创建了authMsg。
+// 然后通过网络发送给对端。然后通过readHandshakeMsg读取对端的回应。
+// 最后调用secrets创建了共享秘密
 // initiatorEncHandshake negotiates a session token on conn.
 // it should be called on the dialing side of the connection.
 //
@@ -305,6 +337,9 @@ func initiatorEncHandshake(conn io.ReadWriter, prv *ecdsa.PrivateKey, remoteID d
 	return h.secrets(authPacket, authRespPacket)
 }
 
+// 这个方法创建了initiator的handshake message。
+// 首先对端的公钥可以通过对端的ID来获取。所以对端的公钥对于发起连接的人来说是知道的。
+// 但是对于被连接的人来说，对端的公钥应该是不知道的
 // makeAuthMsg creates the initiator handshake message.
 func (h *encHandshake) makeAuthMsg(prv *ecdsa.PrivateKey, token []byte) (*authMsgV4, error) {
 	rpub, err := h.remoteID.Pubkey()
@@ -312,6 +347,8 @@ func (h *encHandshake) makeAuthMsg(prv *ecdsa.PrivateKey, token []byte) (*authMs
 		return nil, fmt.Errorf("bad remoteID: %v", err)
 	}
 	h.remotePub = ecies.ImportECDSAPublic(rpub)
+
+	// 这个地方应该是直接使用了静态的共享秘密。 使用自己的私钥和对方的公钥生成的一个共享秘密
 	// Generate random initiator nonce.
 	h.initNonce = make([]byte, shaLen)
 	if _, err := rand.Read(h.initNonce); err != nil {
@@ -323,12 +360,15 @@ func (h *encHandshake) makeAuthMsg(prv *ecdsa.PrivateKey, token []byte) (*authMs
 		return nil, err
 	}
 
+	// 这个地方应该是直接使用了静态的共享秘密。 使用自己的私钥和对方的公钥生成的一个共享秘密
 	// Sign known message: static-shared-secret ^ nonce
 	token, err = h.staticSharedSecret(prv)
 	if err != nil {
 		return nil, err
 	}
 	signed := xor(token, h.initNonce)
+
+	//使用随机的私钥来加密这个信息。
 	signature, err := crypto.Sign(signed, h.randomPrivKey.ExportECDSA())
 	if err != nil {
 		return nil, err
@@ -336,6 +376,7 @@ func (h *encHandshake) makeAuthMsg(prv *ecdsa.PrivateKey, token []byte) (*authMs
 
 	msg := new(authMsgV4)
 	copy(msg.Signature[:], signature)
+	//这里把发起者的公钥告知对方。 这样对方使用自己的私钥和这个公钥可以生成静态的共享秘密
 	copy(msg.InitiatorPubkey[:], crypto.FromECDSAPub(&prv.PublicKey)[1:])
 	copy(msg.Nonce[:], h.initNonce)
 	msg.Version = 4
@@ -464,6 +505,8 @@ func (msg *authRespV4) decodePlain(input []byte) {
 
 var padSpace = make([]byte, 300)
 
+// sealEIP8方法，这个方法是一个组包方法，对msg进行rlp的编码。 填充一些数据。
+// 然后使用对方的公钥把数据进行加密。 这意味着只有对方的私钥才能解密这段信息
 func sealEIP8(msg interface{}, h *encHandshake) ([]byte, error) {
 	buf := new(bytes.Buffer)
 	if err := rlp.Encode(buf, msg); err != nil {
@@ -484,6 +527,13 @@ type plainDecoder interface {
 	decodePlain([]byte)
 }
 
+// readHandshakeMsg这个方法会从两个地方调用。
+// 一个是在initiatorEncHandshake。
+// 一个就是在receiverEncHandshake。
+// 这个方法比较简单。 首先用一种格式尝试解码。如果不行就换另外一种。应该是一种兼容性的设置。
+// 基本上就是使用自己的私钥进行解码然后调用rlp解码成结构体。
+// 结构体的描述就是下面的authRespV4,里面最重要的就是对端的随机公钥。
+// 双方通过自己的私钥和对端的随机公钥可以得到一样的共享秘密。 而这个共享秘密是第三方拿不到的
 func readHandshakeMsg(msg plainDecoder, plainSize int, prv *ecdsa.PrivateKey, r io.Reader) ([]byte, error) {
 	buf := make([]byte, plainSize)
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -558,19 +608,20 @@ var (
 	zero16 = make([]byte, 16)
 )
 
+// rlpx数据分帧 读取写入操作器
 // rlpxFrameRW implements a simplified version of RLPx framing.
 // chunked messages are not supported and all headers are equal to
 // zeroHeader.
 //
 // rlpxFrameRW is not safe for concurrent use from multiple goroutines.
 type rlpxFrameRW struct {
-	conn io.ReadWriter
-	enc  cipher.Stream
-	dec  cipher.Stream
+	conn io.ReadWriter //连接的流
+	enc  cipher.Stream //加密流
+	dec  cipher.Stream //解密流
 
-	macCipher  cipher.Block
-	egressMAC  hash.Hash
-	ingressMAC hash.Hash
+	macCipher  cipher.Block //数据块大小
+	egressMAC  hash.Hash    //输出流mac地址的hash值
+	ingressMAC hash.Hash    //输入流mac地址 的hash值
 
 	snappy bool
 }

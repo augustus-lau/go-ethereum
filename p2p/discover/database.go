@@ -303,6 +303,8 @@ func (db *nodeDB) updateFindFails(id NodeID, fails int) error {
 	return db.storeInt64(makeKey(id, nodeDBDiscoverFindFails), int64(fails))
 }
 
+// 这里从db加载最后相应的节点。
+// 首先根据当前节点的首位生成一个随机数，查看该随机数是否在数据库中，如果在则取出，如果不在，则
 // querySeeds retrieves random nodes to be used as potential seed nodes
 // for bootstrapping.
 func (db *nodeDB) querySeeds(n int, maxAge time.Duration) []*Node {
@@ -319,12 +321,20 @@ seek:
 		// Seek to a random entry. The first byte is incremented by a
 		// random amount each time in order to increase the likelihood
 		// of hitting all existing nodes in very small databases.
-		ctr := id[0]
-		rand.Read(id[:])
-		id[0] = ctr + id[0]%16
-		it.Seek(makeKey(id, nodeDBDiscoverRoot))
 
+		// 取出当前节点的第一位
+		ctr := id[0]
+		//随机产生一个数
+		rand.Read(id[:])
+
+		// 这里因为是16进制，所以除以16，这样就可以第一位的随机数在0-16之间产生
+		id[0] = ctr + id[0]%16
+
+		// 定位到不小于当前节点的一个节点数据，然后往下遍历(leveldb是排序的)
+		it.Seek(makeKey(id, nodeDBDiscoverRoot))
+		// 获取该节点
 		n := nextNode(it)
+
 		if n == nil {
 			id[0] = 0
 			continue seek // iterator exhausted
@@ -335,6 +345,7 @@ seek:
 		if now.Sub(db.bondTime(n.ID)) > maxAge {
 			continue seek
 		}
+		// 查看是否已经存在
 		for i := range nodes {
 			if nodes[i].ID == n.ID {
 				continue seek // duplicate

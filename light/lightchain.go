@@ -42,6 +42,7 @@ var (
 	blockCacheLimit = 256
 )
 
+/* 光链 */
 // LightChain represents a canonical chain that by default only handles block
 // headers, downloading block bodies and receipts on demand through an ODR
 // interface. It only does header validation during chain insertion.

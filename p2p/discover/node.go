@@ -304,6 +304,7 @@ func MustHexID(in string) NodeID {
 	return id
 }
 
+// 根据公钥 做 marshal来生成节点的id --  采用公钥曲线的 x,y坐标来生成的
 // PubkeyID returns a marshaled representation of the given public key.
 func PubkeyID(pub *ecdsa.PublicKey) NodeID {
 	var id NodeID
@@ -311,6 +312,7 @@ func PubkeyID(pub *ecdsa.PublicKey) NodeID {
 	if len(pbytes)-1 != len(id) {
 		panic(fmt.Errorf("need %d bit pubkey, got %d bits", (len(id)+1)*8, len(pbytes)))
 	}
+	// 去掉前两个字节， 也就是 去掉 是否压缩的标志位
 	copy(id[:], pbytes[1:])
 	return id
 }
@@ -328,9 +330,18 @@ func (id NodeID) Pubkey() (*ecdsa.PublicKey, error) {
 	return p, nil
 }
 
+/**
+ * @param hash 是一个对header 后数据的签名
+ * @param sig  是一个签名
+ *
+ *
+ *
+ */
 // recoverNodeID computes the public key used to sign the
 // given hash from the signature.
 func recoverNodeID(hash, sig []byte) (id NodeID, err error) {
+
+	// 获取公钥--- secp256k1 是一种椭圆曲线加密算法--而这个ecc的加密算法，公钥是可以从中算出来的
 	pubkey, err := secp256k1.RecoverPubkey(hash, sig)
 	if err != nil {
 		return id, err

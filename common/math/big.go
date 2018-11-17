@@ -119,6 +119,7 @@ func FirstBitSet(v *big.Int) int {
 	return v.BitLen()
 }
 
+// 将一个biginteger转换为一个大端的byte切片数组。切片的长度至少应该是N位
 // PaddedBigBytes encodes a big integer as a big-endian byte slice. The length
 // of the slice is at least n bytes.
 func PaddedBigBytes(bigint *big.Int, n int) []byte {

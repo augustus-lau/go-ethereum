@@ -17,6 +17,7 @@
 // Package nat provides access to common network port mapping protocols.
 package nat
 
+// 该文件是解决内网到外网转换的解决方案
 import (
 	"errors"
 	"fmt"
@@ -41,6 +42,7 @@ type Interface interface {
 	AddMapping(protocol string, extport, intport int, name string, lifetime time.Duration) error
 	DeleteMapping(protocol string, extport, intport int) error
 
+	//获取外网地址
 	// This method should return the external (Internet-facing)
 	// address of the gateway device.
 	ExternalIP() (net.IP, error)

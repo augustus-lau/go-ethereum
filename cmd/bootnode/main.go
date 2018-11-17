@@ -33,7 +33,16 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/netutil"
 )
 
+/*以太坊在启动时需要告之至少一个对等节点，这样才能接入整个以太坊网络，
+/* bootnode相当于一个第三方的中介，node在启动时会将自己的信息注册到bootnode的路由中，
+/* 并且会从bootnode得到其它节点的路由信息，一旦有了对等节点信息后就可以不需要连接bootnode。
+/* 公有链的节点硬编码了一些bootnode节点地址*/
+
+//生成私钥文件，可以在命令行运行 go run main.go -genkey 来生成私钥
 func main() {
+
+	// P- START,   启动开始  p2p启动的八大问题。。。。。 加密，网络环境，公钥私钥生成，黑名单，udp，基于udp的p2p
+	// P-ONE: 读取启动参数
 	var (
 		listenAddr  = flag.String("addr", ":30301", "listen address")
 		genKey      = flag.String("genkey", "", "generate a node key")
@@ -46,6 +55,7 @@ func main() {
 		verbosity   = flag.Int("verbosity", int(log.LvlInfo), "log verbosity (0-9)")
 		vmodule     = flag.String("vmodule", "", "log verbosity pattern")
 
+		//椭圆曲线非对称加密的 秘钥
 		nodeKey *ecdsa.PrivateKey
 		err     error
 	)
@@ -56,12 +66,18 @@ func main() {
 	glogger.Vmodule(*vmodule)
 	log.Root().SetHandler(glogger)
 
+	// P-TWO: 解析对应的网络环境，nat
 	natm, err := nat.Parse(*natdesc)
 	if err != nil {
 		utils.Fatalf("-nat: %v", err)
 	}
+
 	switch {
+
+	// P-THREE:重点查看如何生成秘钥
 	case *genKey != "":
+
+		// 私钥
 		nodeKey, err = crypto.GenerateKey()
 		if err != nil {
 			utils.Fatalf("could not generate key: %v", err)
@@ -84,11 +100,12 @@ func main() {
 		}
 	}
 
+	// P-FOUR:  将公钥保存到当前节点的对象中
 	if *writeAddr {
 		fmt.Printf("%v\n", discover.PubkeyID(&nodeKey.PublicKey))
 		os.Exit(0)
 	}
-
+	// P-FIVE: 黑名单数据列表
 	var restrictList *netutil.Netlist
 	if *netrestrict != "" {
 		restrictList, err = netutil.ParseNetlist(*netrestrict)
@@ -97,6 +114,7 @@ func main() {
 		}
 	}
 
+	// P-SIX: udp服务
 	addr, err := net.ResolveUDPAddr("udp", *listenAddr)
 	if err != nil {
 		utils.Fatalf("-ResolveUDPAddr: %v", err)
@@ -106,6 +124,7 @@ func main() {
 		utils.Fatalf("-ListenUDP: %v", err)
 	}
 
+	// P-SEVEN: 获取真实的地址
 	realaddr := conn.LocalAddr().(*net.UDPAddr)
 	if natm != nil {
 		if !realaddr.IP.IsLoopback() {
@@ -117,6 +136,7 @@ func main() {
 		}
 	}
 
+	// P-EIGHT:采用哪个版本的p2p
 	if *runv5 {
 		if _, err := discv5.ListenUDP(nodeKey, conn, realaddr, "", restrictList); err != nil {
 			utils.Fatalf("%v", err)
@@ -132,5 +152,6 @@ func main() {
 		}
 	}
 
+	// P-NIGHT:无线循环---服务启动
 	select {}
 }

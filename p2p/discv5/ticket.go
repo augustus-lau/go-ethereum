@@ -56,27 +56,42 @@ const (
 	searchForceQuery    = 4
 )
 
+// 因为时间是单调增长的，所以每个topic的的入场券也就是单调增长的。
+// 这里采用时间来做 topic有效性的索引，让一个指针指向当前失效和有效的分隔点
 // timeBucket represents absolute monotonic time in minutes.
 // It is used as the index into the per-topic ticket buckets.
 type timeBucket int
 
+/* 这里同一个topic的发起人所注册的  n个topic打成一个包，这个包就叫做ticket。这批topic要么一起可以被适用，要么一起停用 */
+/* 这里保存在一起后，怎么查找呢某个具体的topic呢？ 在ticketRef中，idx就是某个topic在 topics和regtime的索引 */
 type ticket struct {
-	topics  []Topic
+	/* 同一批注册的所有topic */
+	topics []Topic
+	/* 按照topics的顺序，保存每个topic的注册时间 */
 	regTime []mclock.AbsTime // Per-topic local absolute time when the ticket can be used.
 
 	// The serial number that was issued by the server.
 	serial uint32
 	// Used by registrar, tracks absolute time when the ticket was created.
+	/* 这批topic 统一发布的时间，也就是将这批topic打成一个包，一起开始可以使用的上线时间 */
 	issueTime mclock.AbsTime
 
 	// Fields used only by registrants
-	node   *Node  // the registrar node that signed this ticket
-	refCnt int    // tracks number of topics that will be registered using this ticket
-	pong   []byte // encoded pong packet signed by the registrar
+	/* 该入场券的登记员 */
+	node *Node // the registrar node that signed this ticket
+
+	/* 该入场券中 关联了多少个topic，也就是topic的个数 */
+	refCnt int // tracks number of topics that will be registered using this ticket
+
+	/* 登记员对该入场券的签名 */
+	pong []byte // encoded pong packet signed by the registrar
 }
 
 // ticketRef refers to a single topic in a ticket.
+/* 由于可以发布很多入场券，所以在定位某一个topic时，需要指明是ticket的指针 */
 type ticketRef struct {
+
+	/* 这存储的只是 ticket的索引索引 */
 	t   *ticket
 	idx int // index of the topic in t.topics and t.regTime
 }
@@ -111,65 +126,108 @@ func pongToTicket(localTime mclock.AbsTime, topics []Topic, node *Node, p *ingre
 	return t, nil
 }
 
+/**
+ * @param t 节点所有订阅号的轮询周期与注册时间(表明订阅可以开始接受)
+ * @param pong  发送的数据包
+ * @return pong 发送的数据包
+ */
 func ticketToPong(t *ticket, pong *pong) {
+
+	//过期时间就是当前时间
 	pong.Expiration = uint64(t.issueTime / mclock.AbsTime(time.Second))
+
+	// 对方订阅号编码规则
 	pong.TopicHash = rlpHash(t.topics)
+
 	pong.TicketSerial = t.serial
+
+	// 获取每个topic的订阅消息频率
 	pong.WaitPeriods = make([]uint32, len(t.regTime))
+
 	for i, regTime := range t.regTime {
+
+		//更新 订阅消息的频率
 		pong.WaitPeriods[i] = uint32(time.Duration(regTime-t.issueTime) / time.Second)
 	}
 }
 
+// ticket存储器，也就是topic的 超时管理器
 type ticketStore struct {
 	// radius detector and target address generator
 	// exists for both searched and registered topics
+	/* 用于半径侦查，保存了里该topic最近的n个节点。广播时不是全网广播，而是在该半径内广播 */
 	radius map[Topic]*topicRadius
 
 	// Contains buckets (for each absolute minute) of tickets
 	// that can be used in that minute.
 	// This is only set if the topic is being registered.
+
+	/* 按照topic对ticket做分类 */
 	tickets map[Topic]*topicTickets
 
-	regQueue []Topic            // Topic registration queue for round robin attempts
-	regSet   map[Topic]struct{} // Topic registration queue contents for fast filling
+	/* 已经注册的topic */
+	regQueue []Topic // Topic registration queue for round robin attempts
 
-	nodes       map[*Node]*ticket
+	/* 已经注册的topic内容 */
+	regSet map[Topic]struct{} // Topic registration queue contents for fast filling
+
+	/* 保存每个节点 对应的入场券 */
+	nodes map[*Node]*ticket
+
+	/* 每个节点最近一次 接受topic的内容 */
 	nodeLastReq map[*Node]reqInfo
-
+	/* 最近一次注册topic的时间 */
 	lastBucketFetched timeBucket
-	nextTicketCached  *ticketRef
-	nextTicketReg     mclock.AbsTime
 
-	searchTopicMap        map[Topic]searchTopic
+	/* ticket中，当前正在使用的topic的下一个 topic是什么 */
+	nextTicketCached *ticketRef
+	/* ticket中，当前正在使用的topic的下一个 topic的注册时间 */
+	nextTicketReg mclock.AbsTime
+	/* 查询topic的请求的缓存 */
+	searchTopicMap map[Topic]searchTopic
+	/* 暂时不知道要做什么 */
 	nextTopicQueryCleanup mclock.AbsTime
-	queriesSent           map[*Node]map[common.Hash]sentQuery
+	/* 保存查询内容：向哪些个节点发送了哪些请求 */
+	queriesSent map[*Node]map[common.Hash]sentQuery
 }
 
+/* 查询topic返回的结果结构 */
 type searchTopic struct {
 	foundChn chan<- *Node
 }
 
+/* 查询请求 */
 type sentQuery struct {
 	sent   mclock.AbsTime
 	lookup lookupInfo
 }
 
+/* 每个注册成功的topic对应的所有入场券。 */
+/* 不管这个topic是本地由本地发布的还是由其他节点发布的，这要这个topic在本地节点注册成功，就代表其可以使用了 */
 type topicTickets struct {
-	buckets    map[timeBucket][]ticketRef
+	buckets map[timeBucket][]ticketRef
+
+	/* 下次查询时间 */
 	nextLookup mclock.AbsTime
-	nextReg    mclock.AbsTime
+	/* 下次注册时间 */
+	nextReg mclock.AbsTime
 }
 
 func newTicketStore() *ticketStore {
 	return &ticketStore{
-		radius:         make(map[Topic]*topicRadius),
-		tickets:        make(map[Topic]*topicTickets),
-		regSet:         make(map[Topic]struct{}),
-		nodes:          make(map[*Node]*ticket),
-		nodeLastReq:    make(map[*Node]reqInfo),
+		/* 一个topic的半径对象 */
+		radius:  make(map[Topic]*topicRadius),
+		tickets: make(map[Topic]*topicTickets),
+		/* 已经注册的topic内容 */
+		regSet: make(map[Topic]struct{}),
+		/* 每个节点对应的ticket（也存储每个节点注册的所有topic） */
+		nodes: make(map[*Node]*ticket),
+		/* 每个节点的最新请求  */
+		nodeLastReq: make(map[*Node]reqInfo),
+		/* 每个topic查询得到结构后 应该保存在哪里 */
 		searchTopicMap: make(map[Topic]searchTopic),
-		queriesSent:    make(map[*Node]map[common.Hash]sentQuery),
+		/*  */
+		queriesSent: make(map[*Node]map[common.Hash]sentQuery),
 	}
 }
 
@@ -178,8 +236,10 @@ func newTicketStore() *ticketStore {
 func (s *ticketStore) addTopic(topic Topic, register bool) {
 	log.Trace("Adding discovery topic", "topic", topic, "register", register)
 	if s.radius[topic] == nil {
+		/* 定义该topic的广播半径内容 */
 		s.radius[topic] = newTopicRadius(topic)
 	}
+	/* 判断是否需要注册，已经注册的topic一定有对应的入场券，入场券代表了一个topic注册的有效性，和使用时间 */
 	if register && s.tickets[topic] == nil {
 		s.tickets[topic] = &topicTickets{buckets: make(map[timeBucket][]ticketRef)}
 	}
@@ -199,6 +259,7 @@ func (s *ticketStore) removeSearchTopic(t Topic) {
 }
 
 // removeRegisterTopic deletes all tickets for the given topic.
+/* 取消该topic 对应的所有入场券 */
 func (s *ticketStore) removeRegisterTopic(topic Topic) {
 	log.Trace("Removing discovery topic", "topic", topic)
 	if s.tickets[topic] == nil {
@@ -217,7 +278,10 @@ func (s *ticketStore) removeRegisterTopic(topic Topic) {
 	delete(s.tickets, topic)
 }
 
+/* 获取当前节点，在本地已经注册成功的所有topic。只要注册成功，必然对应相应的入场券 */
 func (s *ticketStore) regTopicSet() []Topic {
+
+	/* 根据入场券个数来决定注册成功的topic的个数 */
 	topics := make([]Topic, 0, len(s.tickets))
 	for topic := range s.tickets {
 		topics = append(topics, topic)
@@ -456,8 +520,11 @@ func (s *ticketStore) removeTicketRef(ref ticketRef) {
 }
 
 type lookupInfo struct {
-	target       common.Hash
-	topic        Topic
+	/* 从哪个节点查询 */
+	target common.Hash
+	/* 查询的topic名称 */
+	topic Topic
+	/* 是否允许节点进行半径查询 */
 	radiusLookup bool
 }
 
@@ -653,12 +720,22 @@ func (s *ticketStore) gotTopicNodes(from *Node, hash common.Hash, nodes []rpcNod
 }
 
 type topicRadius struct {
-	topic             Topic
-	topicHashPrefix   uint64
+	/* topic名称 */
+	topic Topic
+	/* topic的hash值前缀 */
+	topicHashPrefix uint64
+
+	/* 该topic的半径范围，与最小半径，这里主要用于广播时，在一定距离内广播消息，而非全网广播 */
 	radius, minRadius uint64
-	buckets           []topicRadiusBucket
-	converged         bool
-	radiusLookupCnt   int
+
+	/* 该里该topic最近的 节点列表 */
+	buckets []topicRadiusBucket
+
+	/* 是否可以聚集。。不明白什么意思 */
+	converged bool
+
+	/* 在topic半径距离内 查询的次数 */
+	radiusLookupCnt int
 }
 
 type topicRadiusEvent int
@@ -709,10 +786,19 @@ func (b *topicRadiusBucket) adjust(now mclock.AbsTime, inside float64) {
 	}
 }
 
+/**
+ * 添加一个topic
+ *
+ * 添加时，要需要计算topic的广播半径
+ */
 func newTopicRadius(t Topic) *topicRadius {
+	/* 计算该topic的名字的hash值 */
 	topicHash := crypto.Keccak256Hash([]byte(t))
+
+	/* 取hash的前8位 */
 	topicHashPrefix := binary.BigEndian.Uint64(topicHash[0:8])
 
+	/* 实例化该topic的半径参数 */
 	return &topicRadius{
 		topic:           t,
 		topicHashPrefix: topicHashPrefix,

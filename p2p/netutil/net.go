@@ -215,6 +215,7 @@ func sameNet(bits uint, ip, other net.IP) bool {
 	return nb <= len(ip) && bytes.Equal(ip[:nb], other[:nb])
 }
 
+//路由ip的，保证有n个是处于同一网段中
 // DistinctNetSet tracks IPs, ensuring that at most N of them
 // fall into the same network range.
 type DistinctNetSet struct {

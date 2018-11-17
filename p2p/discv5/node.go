@@ -302,10 +302,19 @@ func MustHexID(in string) NodeID {
 	return id
 }
 
+/**
+ * 根据公钥 产生nodeId,这里采用了椭圆曲线算法  java也支持elliptic的
+ * @param PublicKey 公钥
+ * @return NodeID 节点的key
+ *
+ */
 // PubkeyID returns a marshaled representation of the given public key.
 func PubkeyID(pub *ecdsa.PublicKey) NodeID {
 	var id NodeID
+
+	//根据椭圆曲线的 坐标x,y, 将点转换为 ANSI X9.62 的4.3.6节中指定的形式
 	pbytes := elliptic.Marshal(pub.Curve, pub.X, pub.Y)
+
 	if len(pbytes)-1 != len(id) {
 		panic(fmt.Errorf("need %d bit pubkey, got %d bits", (len(id)+1)*8, len(pbytes)))
 	}
@@ -341,9 +350,12 @@ func recoverNodeID(hash, sig []byte) (id NodeID, err error) {
 	if err != nil {
 		return id, err
 	}
+	//nodeid节点就是公钥
 	if len(pubkey)-1 != len(id) {
 		return id, fmt.Errorf("recovered pubkey has %d bits, want %d bits", len(pubkey)*8, (len(id)+1)*8)
 	}
+
+	// 将公钥的每一位向前移动一位 就是nodeid
 	for i := range id {
 		id[i] = pubkey[i+1]
 	}
@@ -353,6 +365,7 @@ func recoverNodeID(hash, sig []byte) (id NodeID, err error) {
 // distcmp compares the distances a->target and b->target.
 // Returns -1 if a is closer to target, 1 if b is closer to target
 // and 0 if they are equal.
+// 距离比较
 func distcmp(target, a, b common.Hash) int {
 	for i := range target {
 		da := a[i] ^ target[i]
@@ -402,19 +415,20 @@ var lzcount = [256]int{
 	0, 0, 0, 0, 0, 0, 0, 0,
 }
 
+// 256位，32byte
 // logdist returns the logarithmic distance between a and b, log2(a ^ b).
 func logdist(a, b common.Hash) int {
 	lz := 0
 	for i := range a {
 		x := a[i] ^ b[i]
 		if x == 0 {
-			lz += 8
+			lz += 8 //高8位全相同
 		} else {
 			lz += lzcount[x]
 			break
 		}
 	}
-	return len(a)*8 - lz
+	return len(a)*8 - lz //返回从第几位开始不同
 }
 
 // hashAtDistance returns a random hash such that logdist(a, b) == n

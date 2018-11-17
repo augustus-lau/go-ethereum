@@ -16,6 +16,13 @@
 
 package p2p
 
+/**
+ *  该文件dail.go主要是对 net.Dailer的封装，用于创建一个tcp连接
+ *  dail 是监听一个端口来创建一个tcp连接
+ *  socket是监听一个端口，可以创建任何协议的连接
+ *  get是 主要用于http协议
+ *  以上为这几种方式的区别
+ */
 import (
 	"container/heap"
 	"crypto/rand"
@@ -65,6 +72,7 @@ func (t TCPDialer) Dial(dest *discover.Node) (net.Conn, error) {
 	return t.Dialer.Dial("tcp", addr.String())
 }
 
+/* 拨号的状态 */
 // dialstate schedules dials and discovery lookups.
 // it get's a chance to compute new tasks on every iteration
 // of the main loop in Server.run.
@@ -75,15 +83,16 @@ type dialstate struct {
 
 	lookupRunning bool
 	dialing       map[discover.NodeID]connFlag
-	lookupBuf     []*discover.Node // current discovery lookup results
-	randomNodes   []*discover.Node // filled from Table
-	static        map[discover.NodeID]*dialTask
+	lookupBuf     []*discover.Node              // current discovery lookup results
+	randomNodes   []*discover.Node              // filled from Table
+	static        map[discover.NodeID]*dialTask //断连后必须重连的节点
 	hist          *dialHistory
 
 	start     time.Time        // time when the dialer was first used
 	bootnodes []*discover.Node // default dials when there are no peers
 }
 
+/* 这里可以看到 路由表的network层 对tcp层 只开放了如下5个接口 */
 type discoverTable interface {
 	Self() *discover.Node
 	Close()
@@ -127,18 +136,22 @@ type waitExpireTask struct {
 	time.Duration
 }
 
+/* */
 func newDialState(static []*discover.Node, bootnodes []*discover.Node, ntab discoverTable, maxdyn int, netrestrict *netutil.Netlist) *dialstate {
 	s := &dialstate{
-		maxDynDials: maxdyn,
-		ntab:        ntab,
-		netrestrict: netrestrict,
-		static:      make(map[discover.NodeID]*dialTask),
-		dialing:     make(map[discover.NodeID]connFlag),
-		bootnodes:   make([]*discover.Node, len(bootnodes)),
-		randomNodes: make([]*discover.Node, maxdyn/2),
-		hist:        new(dialHistory),
+		maxDynDials: maxdyn,                                 //最大的连接数
+		ntab:        ntab,                                   //network层组件
+		netrestrict: netrestrict,                            //黑名单
+		static:      make(map[discover.NodeID]*dialTask),    //静态节点，断连后必须重连的节点
+		dialing:     make(map[discover.NodeID]connFlag),     //正在拨号的节点
+		bootnodes:   make([]*discover.Node, len(bootnodes)), //守护节点
+		randomNodes: make([]*discover.Node, maxdyn/2),       //
+		hist:        new(dialHistory),                       //历史上拨号成功的记录
 	}
+
+	/* 添加守护节点 */
 	copy(s.bootnodes, bootnodes)
+	/* 添加静态节点  */
 	for _, n := range static {
 		s.addStatic(n)
 	}

@@ -335,3 +335,16 @@ func newkey() *ecdsa.PrivateKey {
 	}
 	return key
 }
+
+func TestRandUint(t *testing.T) {
+	max := 100
+	if max < 2 {
+		return 0
+	}
+	var b [4]byte
+	//随机产生一个32位的无符号整形值
+	rand.Read(b[:])
+	//根据最大值取余数，来随机找一个数组中的值
+	kk := binary.BigEndian.Uint32(b[:]) % max
+	fmt.Println("测试数据" + kk)
+}

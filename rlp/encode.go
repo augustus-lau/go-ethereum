@@ -25,6 +25,7 @@ import (
 )
 
 var (
+	// rlp规则 只支持编码两种格式的数据，字符串 和 列表
 	// Common encoded values.
 	// These are useful when implementing EncodeRLP.
 	EmptyString = []byte{0x80}
@@ -78,6 +79,7 @@ type Encoder interface {
 // Boolean values are not supported, nor are signed integers, floating
 // point numbers, maps, channels and functions.
 func Encode(w io.Writer, val interface{}) error {
+
 	if outer, ok := w.(*encbuf); ok {
 		// Encode was called by some type's EncodeRLP.
 		// Avoid copying by writing to the outer encbuf directly.
@@ -119,15 +121,19 @@ func EncodeToReader(val interface{}) (size int, r io.Reader, err error) {
 }
 
 type encbuf struct {
-	str     []byte      // string data, contains everything except list headers
-	lheads  []*listhead // all list headers
-	lhsize  int         // sum of sizes of all encoded list headers
-	sizebuf []byte      // 9-byte auxiliary buffer for uint encoding
+	//保存字符串数据，除了列表的头
+	str    []byte      // string data, contains everything except list headers
+	lheads []*listhead // all list headers
+	lhsize int         // sum of sizes of all encoded list headers
+	//备用
+	sizebuf []byte // 9-byte auxiliary buffer for uint encoding
 }
 
 type listhead struct {
+	//字符串中的header索引
 	offset int // index of this header in string data
-	size   int // total size of encoded data (including list headers)
+	//列表数据的总大小
+	size int // total size of encoded data (including list headers)
 }
 
 // encode writes head to the given buffer, which must be at least
@@ -179,8 +185,10 @@ func (w *encbuf) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+//编码数据
 func (w *encbuf) encode(val interface{}) error {
 	rval := reflect.ValueOf(val)
+
 	ti, err := cachedTypeInfo(rval.Type(), tags{})
 	if err != nil {
 		return err

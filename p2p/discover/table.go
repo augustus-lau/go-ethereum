@@ -72,15 +72,15 @@ type Table struct {
 	rand    *mrand.Rand       // source of randomness, periodically reseeded
 	ips     netutil.DistinctNetSet
 
-	db         *nodeDB // database of known nodes
-	refreshReq chan chan struct{}
+	db         *nodeDB            // database of known nodes
+	refreshReq chan chan struct{} //重新刷新请求
 	initDone   chan struct{}
 	closeReq   chan struct{}
 	closed     chan struct{}
 
-	bondmu    sync.Mutex
-	bonding   map[NodeID]*bondproc
-	bondslots chan struct{} // limits total number of active bonding processes
+	bondmu    sync.Mutex           //路由表里有很多节点，有些是未建立连接的 ，有些是已经建立连接的
+	bonding   map[NodeID]*bondproc //正在绑定(建立连接)，但连接还未成功
+	bondslots chan struct{}        // limits total number of active bonding processes 正在绑定过程中的数量
 
 	nodeAddedHook func(*Node) // for testing
 
@@ -122,40 +122,57 @@ func newTable(t transport, ourID NodeID, ourAddr *net.UDPAddr, nodeDBPath string
 		net:        t,
 		db:         db,
 		self:       NewNode(ourID, ourAddr.IP, uint16(ourAddr.Port), uint16(ourAddr.Port)),
-		bonding:    make(map[NodeID]*bondproc),
-		bondslots:  make(chan struct{}, maxBondingPingPongs),
+		bonding:    make(map[NodeID]*bondproc),               //哪些节点正在绑定
+		bondslots:  make(chan struct{}, maxBondingPingPongs), //同时发起ping的数量，由于绑定节点必须要发ping命令，所以这里限制同时正在绑定的的节点个数
 		refreshReq: make(chan chan struct{}),
 		initDone:   make(chan struct{}),
 		closeReq:   make(chan struct{}),
 		closed:     make(chan struct{}),
-		rand:       mrand.New(mrand.NewSource(0)),
+		rand:       mrand.New(mrand.NewSource(0)), //创建一个随机函数对象
 		ips:        netutil.DistinctNetSet{Subnet: tableSubnet, Limit: tableIPLimit},
 	}
+
+	// 添加守护节点，守护节点是在配置文件中配置的，
 	if err := tab.setFallbackNodes(bootnodes); err != nil {
 		return nil, err
 	}
+
+	// 将bondslots 正在发起ping、pong的并发控制，起初填充空
 	for i := 0; i < cap(tab.bondslots); i++ {
 		tab.bondslots <- struct{}{}
 	}
+
+	//ips 这里主要考虑的是 节点的ip是否处于同一网段中
 	for i := range tab.buckets {
 		tab.buckets[i] = &bucket{
 			ips: netutil.DistinctNetSet{Subnet: bucketSubnet, Limit: bucketIPLimit},
 		}
 	}
+
+	// 生成64位数组
 	tab.seedRand()
+
+	//加载种子节点，但是不绑定
 	tab.loadSeedNodes(false)
 	// Start the background expiration goroutine after loading seeds so that the search for
 	// seed nodes also considers older nodes that would otherwise be removed by the
 	// expiration.
+
+	//加载完种子节点后，监控db的连接是否过期
 	tab.db.ensureExpirer()
+
+	//开启路由表的轮询 -- 定期刷新路由表
 	go tab.loop()
 	return tab, nil
 }
 
 func (tab *Table) seedRand() {
 	var b [8]byte
+
+	//随机产生一个一个64位的随机数
 	crand.Read(b[:])
 
+	//然后再将该随机数转化为int型，然后种子就是在该int范围内
 	tab.mutex.Lock()
 	tab.rand.Seed(int64(binary.BigEndian.Uint64(b[:])))
 	tab.mutex.Unlock()
@@ -279,6 +296,8 @@ func (tab *Table) Lookup(targetID NodeID) []*Node {
 	return tab.lookup(targetID, true)
 }
 
+// targetID 这里代表的是本机节点
+// refreshIfEmpty 如果没有找到节点，是否重新刷新，从数据库加载节点
 func (tab *Table) lookup(targetID NodeID, refreshIfEmpty bool) []*Node {
 	var (
 		target         = crypto.Keccak256Hash(targetID[:])
@@ -286,7 +305,7 @@ func (tab *Table) lookup(targetID NodeID, refreshIfEmpty bool) []*Node {
 		seen           = make(map[NodeID]bool)
 		reply          = make(chan []*Node, alpha)
 		pendingQueries = 0
-		result         *nodesByDistance
+		result         *nodesByDistance //按照长度远近来排序的节点列表
 	)
 	// don't query further if we hit ourself.
 	// unlikely to happen often in practice.
@@ -295,8 +314,13 @@ func (tab *Table) lookup(targetID NodeID, refreshIfEmpty bool) []*Node {
 	for {
 		tab.mutex.Lock()
 		// generate initial result set
+		// 找到与自己最近的 k个节点 K = bucketSize(每层最大存储个数)
+		// 返回一个由近及远的节点列表
 		result = tab.closest(target, bucketSize)
 		tab.mutex.Unlock()
+
+		//如果找到了这跳出，
+		// 如果没找到，refreshIfEmpty = true时，则从新刷新
 		if len(result.entries) > 0 || !refreshIfEmpty {
 			break
 		}
@@ -308,13 +332,18 @@ func (tab *Table) lookup(targetID NodeID, refreshIfEmpty bool) []*Node {
 		refreshIfEmpty = false
 	}
 
+	// 如果找到了最近的k个节点，或者没有找为nil
 	for {
 		// ask the alpha closest nodes that we haven't asked yet
 		for i := 0; i < len(result.entries) && pendingQueries < alpha; i++ {
+
+			//取出第i个节点
 			n := result.entries[i]
 			if !asked[n.ID] {
 				asked[n.ID] = true
-				pendingQueries++
+				pendingQueries++ //正在查询个数加一
+
+				//起线程在网络中查找该节点
 				go func() {
 					// Find potential neighbors to bond with
 					r, err := tab.net.findnode(n.ID, n.addr(), targetID)
@@ -329,14 +358,20 @@ func (tab *Table) lookup(targetID NodeID, refreshIfEmpty bool) []*Node {
 							tab.delete(n)
 						}
 					}
+
+					//绑定节点，并告诉reply通道，该节点有响应
 					reply <- tab.bondall(r)
 				}()
 			}
 		}
+
+		// 找到了所有的节点，停止
 		if pendingQueries == 0 {
 			// we have asked all closest nodes, stop the search
 			break
 		}
+
+		//如果还有正在请求，未回应的节点
 		// wait for the next reply
 		for _, n := range <-reply {
 			if n != nil && !seen[n.ID] {
@@ -359,16 +394,21 @@ func (tab *Table) refresh() <-chan struct{} {
 	return done
 }
 
+//定期刷新--
 // loop schedules refresh, revalidate runs and coordinates shutdown.
 func (tab *Table) loop() {
 	var (
-		revalidate     = time.NewTimer(tab.nextRevalidateTime())
-		refresh        = time.NewTicker(refreshInterval)
-		copyNodes      = time.NewTicker(copyNodesInterval)
-		revalidateDone = make(chan struct{})
-		refreshDone    = make(chan struct{})           // where doRefresh reports completion
-		waiting        = []chan struct{}{tab.initDone} // holds waiting callers while doRefresh runs
+		revalidate     = time.NewTimer(tab.nextRevalidateTime()) // 路由表中节点存活校验时间间隔
+		refresh        = time.NewTicker(refreshInterval)         // 从db从新拉取种子节点信息的 刷新间隔
+		copyNodes      = time.NewTicker(copyNodesInterval)       // 复制节点的时间间隔
+		revalidateDone = make(chan struct{})                     // 设置table为 有效  完成
+		refreshDone    = make(chan struct{})                     // where doRefresh reports completion 刷新完成
+
+		// 如果有刷新请求进来，则先放到该通道中，如果当前没有正在刷新的线程，则从中取出一个刷新，否则等待。
+		// 如果此时，刚好有其他线程刷新完成，则应该删除掉这里的所有数据，以免重复刷新
+		waiting = []chan struct{}{tab.initDone} // holds waiting callers while doRefresh runs
 	)
+
 	defer refresh.Stop()
 	defer revalidate.Stop()
 	defer copyNodes.Stop()
@@ -379,23 +419,27 @@ func (tab *Table) loop() {
 loop:
 	for {
 		select {
+		// 到刷新间隔时间后，开始刷新
 		case <-refresh.C:
 			tab.seedRand()
 			if refreshDone == nil {
 				refreshDone = make(chan struct{})
 				go tab.doRefresh(refreshDone)
 			}
+			//正在刷新的请求
 		case req := <-tab.refreshReq:
 			waiting = append(waiting, req)
 			if refreshDone == nil {
 				refreshDone = make(chan struct{})
 				go tab.doRefresh(refreshDone)
 			}
+			//刷新完成通道响应机
 		case <-refreshDone:
 			for _, ch := range waiting {
 				close(ch)
 			}
 			waiting, refreshDone = nil, nil
+			//重新验证
 		case <-revalidate.C:
 			go tab.doRevalidate(revalidateDone)
 		case <-revalidateDone:
@@ -425,12 +469,14 @@ loop:
 // bootstrap or discarded faulty peers).
 func (tab *Table) doRefresh(done chan struct{}) {
 	defer close(done)
-
+	//启动一个单线程去从数据库加载节点-- 并且要绑定节点
 	// Load nodes from the database and insert
 	// them. This should yield a few previously seen nodes that are
 	// (hopefully) still alive.
 	tab.loadSeedNodes(true)
 
+	// 以自己为目标节点，去网络中找到离自己最近的节点列表
+	// false，如果找不到最近的节点，是否重新触发刷新，重数据库中从新加载
 	// Run self lookup to discover new neighbor nodes.
 	tab.lookup(tab.self.ID, false)
 
@@ -447,16 +493,25 @@ func (tab *Table) doRefresh(done chan struct{}) {
 	}
 }
 
+// 从db中加载未到期的种子节点
 func (tab *Table) loadSeedNodes(bond bool) {
+	//从数据库中查询所有已经注册的节点 --加载多少个未失效的种子节点
 	seeds := tab.db.querySeeds(seedCount, seedMaxAge)
+
+	// 将所有注册有效的节点与 守护节点合并，作为本地机器的 种子节点
 	seeds = append(seeds, tab.nursery...)
+
+	// 如果要绑定，就直接将本地节点与路由表中的节点进行tcp连接
 	if bond {
 		seeds = tab.bondall(seeds)
 	}
 	for i := range seeds {
 		seed := seeds[i]
+
+		// 获取该节点最后一次的响应时间
 		age := log.Lazy{Fn: func() interface{} { return time.Since(tab.db.bondTime(seed.ID)) }}
 		log.Debug("Found seed node in database", "id", seed.ID, "addr", seed.addr(), "age", age)
+		// 将该节点添加到路由表中
 		tab.add(seed)
 	}
 }
@@ -553,6 +608,7 @@ func (tab *Table) len() (n int) {
 	return n
 }
 
+// 实际去连接通过网络连接节点
 // bondall bonds with all given nodes concurrently and returns
 // those nodes for which bonding has probably succeeded.
 func (tab *Table) bondall(nodes []*Node) (result []*Node) {
@@ -587,35 +643,63 @@ func (tab *Table) bondall(nodes []*Node) (result []*Node) {
 //
 // If pinged is true, the remote node has just pinged us and one half
 // of the process can be skipped.
+
+/**
+ * @param  pinged 远程节点是否已经ping过 本地节点，如果已经ping过了，可以省略部分流程，就不需要主动再次发起ping命令，而直接回应就可以了
+ * @param  对方节点的id
+ * @param  对方的真实地址与udp端口
+ * @param  对方的tcp端口
+ *
+ * 在发起findnode节点
+ *
+ */
 func (tab *Table) bond(pinged bool, id NodeID, addr *net.UDPAddr, tcpPort uint16) (*Node, error) {
+
+	// 如果是自己，忽略
 	if id == tab.self.ID {
 		return nil, errors.New("is self")
 	}
+
+	// 如果tab未初始化，忽略
 	if pinged && !tab.isInitDone() {
 		return nil, errors.New("still initializing")
 	}
 	// Start bonding if we haven't seen this node for a while or if it failed findnode too often.
+	// tab.db.findFails(id) 返回检索失败的次数
+	// tab.db.node(id)返回当前查询的节点
 	node, fails := tab.db.node(id), tab.db.findFails(id)
+
+	//检索该节点，最后一次响应的时间
 	age := time.Since(tab.db.bondTime(id))
 	var result error
+
+	// 如果检索时失败的次数大于0 或者 该节点留存时间过久
+	// 也就是在数据库中没找到该节点，或者该节点已经过期
 	if fails > 0 || age > nodeDBNodeExpiration {
 		log.Trace("Starting bonding ping/pong", "id", id, "known", node != nil, "failcount", fails, "age", age)
 
 		tab.bondmu.Lock()
+		// 如果该节点正在绑定，获取到正在绑定的进程
 		w := tab.bonding[id]
 		if w != nil {
-			// Wait for an existing bonding process to complete.
+			// Wait for an existing bonding process to complete.等待绑定完成
 			tab.bondmu.Unlock()
-			<-w.done
+			<-w.done //表示ping请求已经发起
+
+			//如果内存表中也没找到
 		} else {
 			// Register a new bonding process.
 			w = &bondproc{done: make(chan struct{})}
 			tab.bonding[id] = w
 			tab.bondmu.Unlock()
+
+			//重新对该节点进行连接-- 同步方法，非异步
 			// Do the ping/pong. The result goes into w.
 			tab.pingpong(w, pinged, id, addr, tcpPort)
 			// Unregister the process after it's done.
 			tab.bondmu.Lock()
+
+			//删除该节点 -- 如果正在绑定，这需要删除该节点，以防止重复发送绑定信息
 			delete(tab.bonding, id)
 			tab.bondmu.Unlock()
 		}
@@ -628,6 +712,8 @@ func (tab *Table) bond(pinged bool, id NodeID, addr *net.UDPAddr, tcpPort uint16
 	// Add the node to the table even if the bonding ping/pong
 	// fails. It will be relaced quickly if it continues to be
 	// unresponsive.
+
+	//将该节点添加到 路由表中，并且更新数据库中 该节点失败的次数
 	if node != nil {
 		tab.add(node)
 		tab.db.updateFindFails(id, 0)

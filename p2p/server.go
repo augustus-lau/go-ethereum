@@ -35,13 +35,22 @@ import (
 	"github.com/ethereum/go-ethereum/p2p/netutil"
 )
 
+/**
+ *  这从p2p的服务 启动开始研究
+ *  1、节点服务启动需要什么配置
+ *  2、节点服务启动的同时初始化了什么功能
+ *  3、节点服务提供什么服务
+ *  4、提供的服务时如何实现的
+ */
 const (
-	defaultDialTimeout = 15 * time.Second
+	defaultDialTimeout = 15 * time.Second //默认通话时间 --连接时间
 
 	// Connectivity defaults.
-	maxActiveDialTasks     = 16
-	defaultMaxPendingPeers = 50
-	defaultDialRatio       = 3
+	maxActiveDialTasks     = 16 //最大的有效的连接任务数量--可以理解为同时多少个任务在请求中，
+	defaultMaxPendingPeers = 50 //最大的在等待中的节点
+
+	/* 默认进站与出站的连接数的 比例 */
+	defaultDialRatio = 3
 
 	// Maximum time allowed for reading a complete message.
 	// This is effectively the amount of time a connection can be idle.
@@ -72,10 +81,12 @@ type Config struct {
 	// Setting DialRatio to zero defaults it to 3.
 	DialRatio int `toml:",omitempty"`
 
+	//是否开始节点的发现机制
 	// NoDiscovery can be used to disable the peer discovery mechanism.
 	// Disabling is useful for protocol debugging (manual topology).
 	NoDiscovery bool
 
+	//是否采用v5版本的 发现机制
 	// DiscoveryV5 specifies whether the the new topic-discovery based V5 discovery
 	// protocol should be started or not.
 	DiscoveryV5 bool `toml:",omitempty"`
@@ -84,37 +95,45 @@ type Config struct {
 	// Use common.MakeName to create a name that follows existing conventions.
 	Name string `toml:"-"`
 
+	// 守护节点,用于与其他节点建立连接
 	// BootstrapNodes are used to establish connectivity
 	// with the rest of the network.
 	BootstrapNodes []*discover.Node
 
+	// v5版本的守护节点
 	// BootstrapNodesV5 are used to establish connectivity
 	// with the rest of the network using the V5 discovery
 	// protocol.
 	BootstrapNodesV5 []*discv5.Node `toml:",omitempty"`
 
+	// 断连后必须重连的节点
 	// Static nodes are used as pre-configured connections which are always
 	// maintained and re-connected on disconnects.
 	StaticNodes []*discover.Node
 
+	//信任节点，即使连接数超过了 最大连接数，这些节点也允许去联通
 	// Trusted nodes are used as pre-configured connections which are always
 	// allowed to connect, even above the peer limit.
 	TrustedNodes []*discover.Node
 
+	// 黑名单
 	// Connectivity can be restricted to certain IP networks.
 	// If this option is set to a non-nil value, only hosts which match one of the
 	// IP networks contained in the list are considered.
 	NetRestrict *netutil.Netlist `toml:",omitempty"`
 
+	//保存之前网络中存活的连接地址
 	// NodeDatabase is the path to the database containing the previously seen
 	// live nodes in the network.
 	NodeDatabase string `toml:",omitempty"`
 
+	//这里包含了该节点支持的协议--这个协议指tcp,http等
 	// Protocols should contain the protocols supported
 	// by the server. Matching protocols are launched for
 	// each peer.
 	Protocols []Protocol `toml:"-"`
 
+	//监听的地址，ip:port
 	// If ListenAddr is set to a non-nil address, the server
 	// will listen for incoming connections.
 	//
@@ -123,18 +142,22 @@ type Config struct {
 	// the server is started.
 	ListenAddr string
 
+	//解决内网到外网的转换问题
 	// If set to a non-nil value, the given NAT port mapper
 	// is used to make the listening port available to the
 	// Internet.
 	NAT nat.Interface `toml:",omitempty"`
 
+	// TCP端口服务 -- 如果该节点的tcp端口为空，则该节点只负责在集群内部udp链接通信
 	// If Dialer is set to a non-nil value, the given Dialer
 	// is used to dial outbound peer connections.
 	Dialer NodeDialer `toml:"-"`
 
+	// 如果设置为true, 当前节点不会去主动连接其他任何节点
 	// If NoDial is true, the server will not dial any peers.
 	NoDial bool `toml:",omitempty"`
 
+	//如果设置了EnabrMsgEvsServer，那么每当向对等方发送或接收消息时，服务器将发出PEER事件。
 	// If EnableMsgEvents is set then the server will emit PeerEvents
 	// whenever a message is sent to or received from a peer
 	EnableMsgEvents bool
@@ -143,38 +166,60 @@ type Config struct {
 	Logger log.Logger `toml:",omitempty"`
 }
 
+// 管理所有对等节点的连接
 // Server manages all peer connections.
 type Server struct {
 	// Config fields may not be modified while the server is running.
 	Config
 
+	//这两个是 回调方法
 	// Hooks for testing. These are useful because we can inhibit
 	// the whole protocol stack.
-	newTransport func(net.Conn) transport
-	newPeerHook  func(*Peer)
 
-	lock    sync.Mutex // protects running
+	//根据 conn，构建逻辑传输层对象
+	newTransport func(net.Conn) transport //可以理解为一个保存 其他节点连接对象的通道
+
+	//用于测试 -- 判断peer的id是否合法
+	newPeerHook func(*Peer)
+
+	// 全局的锁
+	lock sync.Mutex // protects running
+
+	//服务是否已经开启
 	running bool
 
-	ntab         discoverTable
-	listener     net.Listener
+	//路由表  -- 抽象接口
+	ntab discoverTable
+
+	// 网络监听器
+	listener net.Listener
+
+	//向外发送消息时的协议，这里存储了 与本节点相连的其他节点支持的所有协议
 	ourHandshake *protoHandshake
-	lastLookup   time.Time
-	DiscV5       *discv5.Network
+
+	//最新一次的查询时间
+	lastLookup time.Time
+
+	// p2p发现机制第5版本中的 网络对象
+	DiscV5 *discv5.Network
 
 	// These are for Peers, PeerCount (and nothing else).
-	peerOp     chan peerOpFunc
+	// peer连接通后发送到该通道
+	peerOp chan peerOpFunc
+
+	// peer连接成功后的对象
 	peerOpDone chan struct{}
 
-	quit          chan struct{}
-	addstatic     chan *discover.Node
-	removestatic  chan *discover.Node
-	posthandshake chan *conn
-	addpeer       chan *conn
-	delpeer       chan peerDrop
-	loopWG        sync.WaitGroup // loop, listenLoop
-	peerFeed      event.Feed
-	log           log.Logger
+	//其他处理事件的通道
+	quit          chan struct{}       //退出
+	addstatic     chan *discover.Node //增加静态节点
+	removestatic  chan *discover.Node //删除静态节点
+	posthandshake chan *conn          //发送握手信息
+	addpeer       chan *conn          //增加同伴节点
+	delpeer       chan peerDrop       //删除同伴节点
+	loopWG        sync.WaitGroup      //锁 --解决协程交互问题
+	peerFeed      event.Feed          //订阅消息填充
+	log           log.Logger          //日志
 }
 
 type peerOpFunc func(map[discover.NodeID]*Peer)
@@ -197,26 +242,41 @@ const (
 // conn wraps a network connection with information gathered
 // during the two handshakes.
 type conn struct {
-	fd net.Conn
-	transport
-	flags connFlag
-	cont  chan error      // The run loop uses cont to signal errors to SetupConn.
-	id    discover.NodeID // valid after the encryption handshake
-	caps  []Cap           // valid after the protocol handshake
-	name  string          // valid after the protocol handshake
+	fd        net.Conn        //客户端的socket，或者叫句柄
+	transport                 //传输协议，tcp采用的是rlp传输协议
+	flags     connFlag        //参数
+	cont      chan error      // The run loop uses cont to signal errors to SetupConn.  //如果连接有任何错误，都发送到该通道中
+	id        discover.NodeID // valid after the encryption handshake  //客户端的id
+	caps      []Cap           // valid after the protocol handshake   //客户端支持的协议
+	name      string          // valid after the protocol handshake   //客户端的名字
 }
 
+/**
+ *  逻辑传输层
+ *  这里讲两个节点之间的通道抽象为一个逻辑传输通道
+ *  conn：可以理解为一个通道，只要连接上就可以发送数据
+ *  transport：这是逻辑上的通道，当conn连接上后，这里还要确认连接是否有效，比如加了逻辑验证。如果验证通过，才代表传输层连接通了
+ *             如果验证未通过，则应该关闭conn。
+ */
 type transport interface {
 	// The two handshakes.
+	//通过这个方法来完成交换密钥，创建加密信道的流程。如果失败，那么链接关闭。
 	doEncHandshake(prv *ecdsa.PrivateKey, dialDest *discover.Node) (discover.NodeID, error)
+
+	//这个方法来进行协议特性之间的协商，比如双方的协议版本，是否支持Snappy加密方式等操作
 	doProtoHandshake(our *protoHandshake) (*protoHandshake, error)
 	// The MsgReadWriter can only be used after the encryption
 	// handshake has completed. The code uses conn.id to track this
 	// by setting it to a non-nil value after the encryption handshake.
+
+	//如果以上两个方法都通过，就说明连接已经建立
+
+	// 传输层的流
 	MsgReadWriter
 	// transports must provide Close because we use MsgPipe in some of
 	// the tests. Closing the actual network connection doesn't do
 	// anything in those tests because NsgPipe doesn't use it.
+	//关闭传输层
 	close(err error)
 }
 
@@ -253,6 +313,8 @@ func (c *conn) is(f connFlag) bool {
 	return c.flags&f != 0
 }
 
+// 返回已经连接的所有节点 -- 采用了通道的方式来统计的？为什么？
+// 当前对peer的所有操作都采用通道方式处理，主要是为了解决多线程问题
 // Peers returns all connected peers.
 func (srv *Server) Peers() []*Peer {
 	var ps []*Peer
@@ -265,23 +327,28 @@ func (srv *Server) Peers() []*Peer {
 			ps = append(ps, p)
 		}
 	}:
+		// 将该peer的对象从done中删除掉 -- 这里不明白
 		<-srv.peerOpDone
-	case <-srv.quit:
+	case <-srv.quit: //如果该通道不为空
 	}
 	return ps
 }
 
+// 统计当前服务连接了多少节点 也要用通道么
+// 当前对peer的所有操作都采用通道方式处理，主要是为了解决多线程问题
 // PeerCount returns the number of connected peers.
 func (srv *Server) PeerCount() int {
 	var count int
 	select {
 	case srv.peerOp <- func(ps map[discover.NodeID]*Peer) { count = len(ps) }:
+		// 将该peer的对象从done中删除掉
 		<-srv.peerOpDone
 	case <-srv.quit:
 	}
 	return count
 }
 
+// 添加一个节点，并连接
 // AddPeer connects to the given node and maintains the connection until the
 // server is shut down. If the connection fails for any reason, the server will
 // attempt to reconnect the peer.
@@ -292,6 +359,7 @@ func (srv *Server) AddPeer(node *discover.Node) {
 	}
 }
 
+// 删除已经连接的对象
 // RemovePeer disconnects from the given node
 func (srv *Server) RemovePeer(node *discover.Node) {
 	select {
@@ -300,11 +368,14 @@ func (srv *Server) RemovePeer(node *discover.Node) {
 	}
 }
 
+// 用于广播
+// 添加订阅的事件 -- 当对方的peer有相应的事件传递过来后，会放入对应的通道中
 // SubscribePeers subscribes the given channel to peer events
 func (srv *Server) SubscribeEvents(ch chan *PeerEvent) event.Subscription {
 	return srv.peerFeed.Subscribe(ch)
 }
 
+// 返回当前服务器的信息 --
 // Self returns the local node's endpoint information.
 func (srv *Server) Self() *discover.Node {
 	srv.lock.Lock()
@@ -353,6 +424,8 @@ func (srv *Server) Stop() {
 	srv.loopWG.Wait()
 }
 
+// 对于不做任何处理的 信息，我们统一放到一个channel中， 这样是为了提高效率，因为这部分消息只读，不需要回复。
+// 我们把这个channel叫做共享无需回复通道 --- 只针对UDP端口
 // sharedUDPConn implements a shared connection. Write sends messages to the underlying connection while read returns
 // messages that were found unprocessable and sent to the unhandled channel by the primary listener.
 type sharedUDPConn struct {
@@ -360,8 +433,16 @@ type sharedUDPConn struct {
 	unhandled chan discover.ReadPacket
 }
 
+// 从 sharedUDPConn 读取 接收到的数据
 // ReadFromUDP implements discv5.conn
+/**
+ * @return n    表示接收到的数据大小
+ * @return addr 表示数据的来源
+ *
+ */
 func (s *sharedUDPConn) ReadFromUDP(b []byte) (n int, addr *net.UDPAddr, err error) {
+
+	//从共享无需回复通道中获取一条数据
 	packet, ok := <-s.unhandled
 	if !ok {
 		return 0, nil, fmt.Errorf("Connection was closed")
@@ -379,6 +460,7 @@ func (s *sharedUDPConn) Close() error {
 	return nil
 }
 
+// 启动该节点
 // Start starts running the server.
 // Servers can not be re-used after stopping.
 func (srv *Server) Start() (err error) {
@@ -398,20 +480,26 @@ func (srv *Server) Start() (err error) {
 	if srv.PrivateKey == nil {
 		return fmt.Errorf("Server.PrivateKey must be set to a non-nil key")
 	}
+
+	//默认初始化 传输通道 为 rlpx -- 用于udp，tcp(不是http)传输
 	if srv.newTransport == nil {
 		srv.newTransport = newRLPX
 	}
+
+	//go中创建一个tcp连接的 方式 --- 这里并没有开启tcp，只是封装了下
 	if srv.Dialer == nil {
 		srv.Dialer = TCPDialer{&net.Dialer{Timeout: defaultDialTimeout}}
 	}
+
+	// 初始化 channel
 	srv.quit = make(chan struct{})
 	srv.addpeer = make(chan *conn)
 	srv.delpeer = make(chan peerDrop)
 	srv.posthandshake = make(chan *conn)
 	srv.addstatic = make(chan *discover.Node)
 	srv.removestatic = make(chan *discover.Node)
-	srv.peerOp = make(chan peerOpFunc)
-	srv.peerOpDone = make(chan struct{})
+	srv.peerOp = make(chan peerOpFunc)   //操作peer的通道，只要是对peer的修改操作都放到该通道中
+	srv.peerOpDone = make(chan struct{}) //操作peer完毕的通知通道。当操作peer完毕后，在这里放一个信号，以方便通知其他线程操作
 
 	var (
 		conn      *net.UDPConn
@@ -420,20 +508,32 @@ func (srv *Server) Start() (err error) {
 		unhandled chan discover.ReadPacket
 	)
 
+	//////////////////////////////////初始化 Discover ////////////////Start//////////////////////////////////////////////////
+	/**
+	 * !srv.NoDiscovery || srv.DiscoveryV5
+	 * 这个是判断是否需要开始自动发现机制
+	 */
+	// 判断是否开始发现机制，如果开启则初始化UDP(发现机制主要采用udp来创建)
 	if !srv.NoDiscovery || srv.DiscoveryV5 {
+
+		// 解析udp的端口地址
 		addr, err := net.ResolveUDPAddr("udp", srv.ListenAddr)
 		if err != nil {
 			return err
 		}
+		//开启一个udp的端口---这个udp 只用于discover，所以要把它传递给discover对象
 		conn, err = net.ListenUDP("udp", addr)
 		if err != nil {
 			return err
 		}
 		realaddr = conn.LocalAddr().(*net.UDPAddr)
+
+		// 如果是在nat环境下 --- 这需要了解nat环境
 		if srv.NAT != nil {
 			if !realaddr.IP.IsLoopback() {
 				go nat.Map(srv.NAT, srv.quit, "udp", realaddr.Port, realaddr.Port, "ethereum discovery")
 			}
+			//获取本机的外网地址
 			// TODO: react to external IP changes over time.
 			if ext, err := srv.NAT.ExternalIP(); err == nil {
 				realaddr = &net.UDPAddr{IP: ext, Port: realaddr.Port}
@@ -441,33 +541,48 @@ func (srv *Server) Start() (err error) {
 		}
 	}
 
+	//如果开了发现机制 -- 在udp端口 开一个100大小的channel， 用于接受不做任何处理的信息
 	if !srv.NoDiscovery && srv.DiscoveryV5 {
 		unhandled = make(chan discover.ReadPacket, 100)
 		sconn = &sharedUDPConn{conn, unhandled}
 	}
 
-	// node table
+	// srv.NoDiscovery = false, 不启用  自动发现机制时 ---- 非加密方式启动
+	// 那么这时候 主要是从db里获取种子节点来维护路由表信息
 	if !srv.NoDiscovery {
+
+		//节点发现机制的配置
 		cfg := discover.Config{
-			PrivateKey:   srv.PrivateKey,
-			AnnounceAddr: realaddr,
-			NodeDBPath:   srv.NodeDatabase,
-			NetRestrict:  srv.NetRestrict,
-			Bootnodes:    srv.BootstrapNodes,
-			Unhandled:    unhandled,
+			PrivateKey:   srv.PrivateKey,     //私钥
+			AnnounceAddr: realaddr,           //真实地址
+			NodeDBPath:   srv.NodeDatabase,   //本节点的数据库地址
+			NetRestrict:  srv.NetRestrict,    //本节点的黑名单
+			Bootnodes:    srv.BootstrapNodes, //本节点的守护节点地址
+			Unhandled:    unhandled,          //无用信息的处理通道
 		}
-		ntab, err := discover.ListenUDP(conn, cfg)
+
+		// 根据以上配置 初始化udp对象---- 这里采用不加密的方式进行udp数据传输
+		// 主要是讲udp的连接进一步封装，然后启动配置中的db, 初始化本地路由表等---返回本节点的路由表
+		// 单独启动一个线程来监听
+		ntab, err := discover.ListenUDP(conn, cfg) //这是旧版本的 udp处理方式
 		if err != nil {
 			return err
 		}
 		srv.ntab = ntab
 	}
 
+	////// 到这里为止，udp已经启动，而且可以接受请求。table的loop循环也已经开始工作///////////////////////
+
+	//上面是 不启用自动发现机制时  discover的创建，这里是启用 自动发现机制时，discover的创建
+	// 上方的并未加密， ------加密方式启动
 	if srv.DiscoveryV5 {
 		var (
 			ntab *discv5.Network
 			err  error
 		)
+
+		//新版本的udp处理方式
+		//如果sconn 不为空，存在 不响应数据通道时，该共享udp连接也要加密
 		if sconn != nil {
 			ntab, err = discv5.ListenUDP(srv.PrivateKey, sconn, realaddr, "", srv.NetRestrict) //srv.NodeDatabase)
 		} else {
@@ -476,21 +591,33 @@ func (srv *Server) Start() (err error) {
 		if err != nil {
 			return err
 		}
+
+		/* 当真正添加完守护节点后，路由表的刷新就正式开始。否则有可能路由表的种子节点为空 */
 		if err := ntab.SetFallbackNodes(srv.BootstrapNodesV5); err != nil {
 			return err
 		}
 		srv.DiscV5 = ntab
 	}
 
+	//////////////////////////////////初始化 Discover ////////////////End//////////////////////////////////////////////////
+
+	//////////////////////////////////初始化  TCP服务 ////////////////Start//////////////////////////////////////////////////
+
+	/* dail tcp的连接数 */
 	dynPeers := srv.maxDialedConns()
+
+	/* 生成拨号对象(主动去连接其他节点的对象) */
 	dialer := newDialState(srv.StaticNodes, srv.BootstrapNodes, srv.ntab, dynPeers, srv.NetRestrict)
 
-	// handshake
+	// handshake  -- tcp端口 连接 需要采用的协议
 	srv.ourHandshake = &protoHandshake{Version: baseProtocolVersion, Name: srv.Name, ID: discover.PubkeyID(&srv.PrivateKey.PublicKey)}
+
+	//添加上本节点支持的 所有协议
 	for _, p := range srv.Protocols {
 		srv.ourHandshake.Caps = append(srv.ourHandshake.Caps, p.cap())
 	}
-	// listen/dial
+
+	// 启动本节点的rpc服务
 	if srv.ListenAddr != "" {
 		if err := srv.startListening(); err != nil {
 			return err
@@ -500,12 +627,19 @@ func (srv *Server) Start() (err error) {
 		srv.log.Warn("P2P server will be useless, neither dialing nor listening")
 	}
 
+	//启动一个线程来接受tcp的请求
 	srv.loopWG.Add(1)
+
+	/* 启动拨号器的调度 */
 	go srv.run(dialer)
 	srv.running = true
+
+	//////////////////////////////////初始化  TCP服务 ////////////////End//////////////////////////////////////////////////
+
 	return nil
 }
 
+// 启动tcp的监听器， 也就是启动tcp服务
 func (srv *Server) startListening() error {
 	// Launch the TCP listener.
 	listener, err := net.Listen("tcp", srv.ListenAddr)
@@ -515,7 +649,11 @@ func (srv *Server) startListening() error {
 	laddr := listener.Addr().(*net.TCPAddr)
 	srv.ListenAddr = laddr.String()
 	srv.listener = listener
+
+	//解决go协程 同步的问题
 	srv.loopWG.Add(1)
+
+	//协程 loop监听
 	go srv.listenLoop()
 	// Map the TCP listening port if NAT is configured.
 	if !laddr.IP.IsLoopback() && srv.NAT != nil {
@@ -721,6 +859,7 @@ func (srv *Server) maxInboundConns() int {
 }
 
 func (srv *Server) maxDialedConns() int {
+	/* 如果不启动发现机制 */
 	if srv.NoDiscovery || srv.NoDial {
 		return 0
 	}
@@ -735,21 +874,31 @@ type tempError interface {
 	Temporary() bool
 }
 
+/* tcp端口的监听器 */
 // listenLoop runs in its own goroutine and accepts
 // inbound connections.
 func (srv *Server) listenLoop() {
 	defer srv.loopWG.Done()
 	srv.log.Info("RLPx listener up", "self", srv.makeSelf(srv.listener, srv.ntab))
 
+	/* 设置最大的等待中的连接 */
 	tokens := defaultMaxPendingPeers
+
+	// 配置文件中最大的等待连接 设置
 	if srv.MaxPendingPeers > 0 {
 		tokens = srv.MaxPendingPeers
 	}
+
+	// 创建一个 tokens大小的缓冲区，保存正在等待的连接请求
 	slots := make(chan struct{}, tokens)
+
+	/* 先将缓冲区放满空数据，当每次循环开始时，就取出一个空对象，这样缓冲区中就只剩一个空缺位置，来保证每次只能进连接一个请求。这样是为了控制并发 */
+	/* 我叫它 卡槽设置，是一种无锁的并发控制 */
 	for i := 0; i < tokens; i++ {
 		slots <- struct{}{}
 	}
 
+	//无线循环
 	for {
 		// Wait for a handshake slot before accepting.
 		<-slots
@@ -758,6 +907,8 @@ func (srv *Server) listenLoop() {
 			fd  net.Conn
 			err error
 		)
+
+		// 接收到连接后-- 首先判断连接是否有中断等错误
 		for {
 			fd, err = srv.listener.Accept()
 			if tempErr, ok := err.(tempError); ok && tempErr.Temporary() {
@@ -770,20 +921,29 @@ func (srv *Server) listenLoop() {
 			break
 		}
 
+		// 如果有网络限制，即黑名单
 		// Reject connections that do not match NetRestrict.
 		if srv.NetRestrict != nil {
 			if tcp, ok := fd.RemoteAddr().(*net.TCPAddr); ok && !srv.NetRestrict.Contains(tcp.IP) {
 				srv.log.Debug("Rejected conn (not whitelisted in NetRestrict)", "addr", fd.RemoteAddr())
 				fd.Close()
+
+				/* 将卡槽填满，控制并发 */
 				slots <- struct{}{}
 				continue
 			}
 		}
 
+		/* 封装一下tcp的连接 */
 		fd = newMeteredConn(fd, true)
 		srv.log.Trace("Accepted connection", "addr", fd.RemoteAddr())
+
+		/* 协程处理请求，nio模式 */
 		go func() {
+
+			/* 以进站方式 连接 */
 			srv.SetupConn(fd, inboundConn, nil)
+			/* 处理完成后，填充满卡槽 */
 			slots <- struct{}{}
 		}()
 	}
@@ -797,7 +957,11 @@ func (srv *Server) SetupConn(fd net.Conn, flags connFlag, dialDest *discover.Nod
 	if self == nil {
 		return errors.New("shutdown")
 	}
+
+	// 创建一个自身封装的连接
 	c := &conn{fd: fd, transport: srv.newTransport(fd), flags: flags, cont: make(chan error)}
+
+	// 这一步就是 将客户段socket封装成peer对象，并保存到本地的缓存中
 	err := srv.setupConn(c, flags, dialDest)
 	if err != nil {
 		c.close(err)
@@ -806,6 +970,7 @@ func (srv *Server) SetupConn(fd net.Conn, flags connFlag, dialDest *discover.Nod
 	return err
 }
 
+// 建立连接-- ，就是将客户端过来的socket封装，并保存到本地
 func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *discover.Node) error {
 	// Prevent leftover pending conns from entering the handshake.
 	srv.lock.Lock()
@@ -814,23 +979,33 @@ func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *discover.Node) e
 	if !running {
 		return errServerStopped
 	}
+
+	// 创建加密的的握手的步骤如下：
 	// Run the encryption handshake.
 	var err error
+
+	// 第一步：发送本地私钥到对方节点-- 并且让对方发送对方的id
 	if c.id, err = c.doEncHandshake(srv.PrivateKey, dialDest); err != nil {
 		srv.log.Trace("Failed RLPx handshake", "addr", c.fd.RemoteAddr(), "conn", c.flags, "err", err)
 		return err
 	}
+
 	clog := srv.log.New("id", c.id, "addr", c.fd.RemoteAddr(), "conn", c.flags)
+
+	// 第二步：检查返回的id ，与 socket中读取的id是否相同
 	// For dialed connections, check that the remote public key matches.
 	if dialDest != nil && c.id != dialDest.ID {
 		clog.Trace("Dialed identity mismatch", "want", c, dialDest.ID)
 		return DiscUnexpectedIdentity
 	}
+	// 第三步：没看懂  检查posthandshake 协议
 	err = srv.checkpoint(c, srv.posthandshake)
 	if err != nil {
 		clog.Trace("Rejected peer before protocol handshake", "err", err)
 		return err
 	}
+
+	// 第四步 ： 检查ourHandshake协议 -- 让对方返回其支持的所有协议
 	// Run the protocol handshake
 	phs, err := c.doProtoHandshake(srv.ourHandshake)
 	if err != nil {
@@ -841,7 +1016,11 @@ func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *discover.Node) e
 		clog.Trace("Wrong devp2p handshake identity", "err", phs.ID)
 		return DiscUnexpectedIdentity
 	}
+
+	// 保存对方节点支持的协议名称，及协议的版本号
 	c.caps, c.name = phs.Caps, phs.Name
+
+	// 第五步：连接已经建立，保存到本地的peer缓存中
 	err = srv.checkpoint(c, srv.addpeer)
 	if err != nil {
 		clog.Trace("Rejected peer", "err", err)
@@ -860,6 +1039,7 @@ func truncateName(s string) string {
 	return s
 }
 
+//主要是检查通到中是否有错误
 // checkpoint sends the conn to run, which performs the
 // post-handshake checks for the stage (posthandshake, addpeer).
 func (srv *Server) checkpoint(c *conn, stage chan<- *conn) error {
@@ -876,6 +1056,7 @@ func (srv *Server) checkpoint(c *conn, stage chan<- *conn) error {
 	}
 }
 
+// 用本地服务 启动peer服务
 // runPeer runs in its own goroutine for each peer.
 // it waits until the Peer logic returns and removes
 // the peer.
@@ -884,15 +1065,20 @@ func (srv *Server) runPeer(p *Peer) {
 		srv.newPeerHook(p)
 	}
 
+	//广播，如果本地服务添加了一个peer，那么就全网广播，让其他节点也添加该peer
+	//当广播出去后，其他节点就会根据kad算法来决定是否添加
 	// broadcast peer add
 	srv.peerFeed.Send(&PeerEvent{
 		Type: PeerEventTypeAdd,
 		Peer: p.ID(),
 	})
 
+	// 启动peer节点----------- 这里没理解为什么会有个启动对方的节点
 	// run the protocol
+	// --一直阻塞，知道有错误产生
 	remoteRequested, err := p.run()
 
+	// 如果上面产生错误-- 则广播该节点有问题，并说明该节点的错误类型
 	// broadcast peer drop
 	srv.peerFeed.Send(&PeerEvent{
 		Type:  PeerEventTypeDrop,
@@ -905,6 +1091,7 @@ func (srv *Server) runPeer(p *Peer) {
 	srv.delpeer <- peerDrop{p, err, remoteRequested}
 }
 
+// 从请求信息里得出的 peer节点信息
 // NodeInfo represents a short summary of the information known about the host.
 type NodeInfo struct {
 	ID    string `json:"id"`    // Unique node identifier (also the encryption key)
@@ -916,9 +1103,10 @@ type NodeInfo struct {
 		Listener  int `json:"listener"`  // TCP listening port for RLPx
 	} `json:"ports"`
 	ListenAddr string                 `json:"listenAddr"`
-	Protocols  map[string]interface{} `json:"protocols"`
+	Protocols  map[string]interface{} `json:"protocols"` //这是保存 协议名 --> 改协议的对应的处理handler
 }
 
+// 返回该节点的基本信息
 // NodeInfo gathers and returns a collection of metadata known about the host.
 func (srv *Server) NodeInfo() *NodeInfo {
 	node := srv.Self()
@@ -948,6 +1136,7 @@ func (srv *Server) NodeInfo() *NodeInfo {
 	return info
 }
 
+// 返回本地已经排序好的 peers
 // PeersInfo returns an array of metadata objects describing connected peers.
 func (srv *Server) PeersInfo() []*PeerInfo {
 	// Gather all the generic and sub-protocol specific infos

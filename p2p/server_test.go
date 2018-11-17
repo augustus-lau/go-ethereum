@@ -42,6 +42,7 @@ type testTransport struct {
 	closeErr error
 }
 
+// 测试  创建一个新的传输层协议
 func newTestTransport(id discover.NodeID, fd net.Conn) transport {
 	wrapped := newRLPX(fd).(*rlpx)
 	wrapped.rw = newRLPXFrameRW(fd, secrets{
@@ -66,6 +67,7 @@ func (c *testTransport) close(err error) {
 	c.closeErr = err
 }
 
+//测试 启动服务
 func startTestServer(t *testing.T, id discover.NodeID, pf func(*Peer)) *Server {
 	config := Config{
 		Name:       "test",

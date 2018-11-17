@@ -27,6 +27,7 @@ import (
 	"gopkg.in/fatih/set.v0"
 )
 
+// 这个是描述api由什么构成的
 // API describes the set of methods offered over the RPC interface
 type API struct {
 	Namespace string      // namespace under which the rpc methods of Service are exposed
@@ -35,6 +36,7 @@ type API struct {
 	Public    bool        // indication if the methods must be considered safe for public use
 }
 
+// 描述回调方法的返回
 // callback is a method callback which was registered in the server
 type callback struct {
 	rcvr        reflect.Value  // receiver of method
@@ -45,14 +47,16 @@ type callback struct {
 	isSubscribe bool           // indication if the callback is a subscription
 }
 
+//一个服务的构成
 // service represents a registered object
 type service struct {
-	name          string        // name for service
-	typ           reflect.Type  // receiver type
-	callbacks     callbacks     // registered handlers
-	subscriptions subscriptions // available subscriptions/notifications
+	name          string        // name for service  服务的名称
+	typ           reflect.Type  // receiver type     服务的类型
+	callbacks     callbacks     // registered handlers  服务的回调列表
+	subscriptions subscriptions // available subscriptions/notifications  回调列表的描述
 }
 
+// 服务接收到的请求
 // serverRequest is an incoming request
 type serverRequest struct {
 	id            interface{}
@@ -67,15 +71,17 @@ type serviceRegistry map[string]*service // collection of services
 type callbacks map[string]*callback      // collection of RPC callbacks
 type subscriptions map[string]*callback  // collection of subscription callbacks
 
+// 一个rpc的服务
 // Server represents a RPC server
 type Server struct {
-	services serviceRegistry
+	services serviceRegistry //该服务器中注册的服务
 
 	run      int32
-	codecsMu sync.Mutex
+	codecsMu sync.Mutex // 服务锁
 	codecs   *set.Set
 }
 
+// 一个rpc的请求
 // rpcRequest represents a raw incoming RPC request
 type rpcRequest struct {
 	service  string

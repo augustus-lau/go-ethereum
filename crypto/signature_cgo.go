@@ -57,6 +57,8 @@ func Sign(hash []byte, prv *ecdsa.PrivateKey) (sig []byte, err error) {
 	}
 	seckey := math.PaddedBigBytes(prv.D, prv.Params().BitSize/8)
 	defer zeroBytes(seckey)
+
+	//采用私钥对其签名
 	return secp256k1.Sign(hash, seckey)
 }
 
@@ -81,6 +83,7 @@ func CompressPubkey(pubkey *ecdsa.PublicKey) []byte {
 	return secp256k1.CompressPubkey(pubkey.X, pubkey.Y)
 }
 
+// 返回一个定义好参数的曲线形状对象，这里采用了标准的secp256k1
 // S256 returns an instance of the secp256k1 curve.
 func S256() elliptic.Curve {
 	return secp256k1.S256()

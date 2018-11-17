@@ -32,30 +32,31 @@ import (
 )
 
 const (
-	baseProtocolVersion    = 5
-	baseProtocolLength     = uint64(16)
-	baseProtocolMaxMsgSize = 2 * 1024
+	baseProtocolVersion    = 5          //版本号
+	baseProtocolLength     = uint64(16) //协议长度
+	baseProtocolMaxMsgSize = 2 * 1024   //协议信息长度
 
 	snappyProtocolVersion = 5
 
-	pingInterval = 15 * time.Second
+	pingInterval = 15 * time.Second //心跳时间间隔
 )
 
 const (
 	// devp2p message codes
-	handshakeMsg = 0x00
-	discMsg      = 0x01
-	pingMsg      = 0x02
-	pongMsg      = 0x03
+	handshakeMsg = 0x00 //握手信息
+	discMsg      = 0x01 //断开信息
+	pingMsg      = 0x02 //ping发送信息
+	pongMsg      = 0x03 //相应ping的返回信息
 )
 
 // protoHandshake is the RLP structure of the protocol handshake.
+// 自定义握手协议
 type protoHandshake struct {
-	Version    uint64
-	Name       string
-	Caps       []Cap
-	ListenPort uint64
-	ID         discover.NodeID
+	Version    uint64          //版本号
+	Name       string          //同伴的名称
+	Caps       []Cap           //支持的哪些协议 及协议的版本
+	ListenPort uint64          //监听的端口
+	ID         discover.NodeID //要握手的节点ID，同伴节点的ID
 
 	// Ignore additional fields (for forward compatibility).
 	Rest []rlp.RawValue `rlp:"tail"`
@@ -67,50 +68,53 @@ type PeerEventType string
 const (
 	// PeerEventTypeAdd is the type of event emitted when a peer is added
 	// to a p2p.Server
-	PeerEventTypeAdd PeerEventType = "add"
+	PeerEventTypeAdd PeerEventType = "add" //同伴被加入网络中
 
 	// PeerEventTypeDrop is the type of event emitted when a peer is
 	// dropped from a p2p.Server
-	PeerEventTypeDrop PeerEventType = "drop"
+	PeerEventTypeDrop PeerEventType = "drop" //同伴从网络中剔除掉
 
 	// PeerEventTypeMsgSend is the type of event emitted when a
 	// message is successfully sent to a peer
-	PeerEventTypeMsgSend PeerEventType = "msgsend"
+	PeerEventTypeMsgSend PeerEventType = "msgsend" //给同伴发消息
 
 	// PeerEventTypeMsgRecv is the type of event emitted when a
 	// message is received from a peer
-	PeerEventTypeMsgRecv PeerEventType = "msgrecv"
+	PeerEventTypeMsgRecv PeerEventType = "msgrecv" //从同伴接收消息
 )
 
 // PeerEvent is an event emitted when peers are either added or dropped from
 // a p2p.Server or when a message is sent or received on a peer connection
+//接收到的消息是json格式的
 type PeerEvent struct {
-	Type     PeerEventType   `json:"type"`
-	Peer     discover.NodeID `json:"peer"`
-	Error    string          `json:"error,omitempty"`
-	Protocol string          `json:"protocol,omitempty"`
-	MsgCode  *uint64         `json:"msg_code,omitempty"`
-	MsgSize  *uint32         `json:"msg_size,omitempty"`
+	Type     PeerEventType   `json:"type"`               //消息类型
+	Peer     discover.NodeID `json:"peer"`               //消息从哪里来的
+	Error    string          `json:"error,omitempty"`    //是否有错误
+	Protocol string          `json:"protocol,omitempty"` //协议
+	MsgCode  *uint64         `json:"msg_code,omitempty"` //消息码
+	MsgSize  *uint32         `json:"msg_size,omitempty"` //消息内容大小
 }
 
 // Peer represents a connected remote node.
+// 代表到另一个节点的连接
 type Peer struct {
-	rw      *conn
-	running map[string]*protoRW
+	rw      *conn               //连接
+	running map[string]*protoRW //协议通道
 	log     log.Logger
 	created mclock.AbsTime
 
 	wg       sync.WaitGroup
-	protoErr chan error
-	closed   chan struct{}
+	protoErr chan error    //错误通道用于结束错误
+	closed   chan struct{} //同伴关闭后 会发关闭消息到此通道
 	disc     chan DiscReason
 
 	// events receives message send / receive events if set
 	events *event.Feed
 }
 
-// NewPeer returns a peer for testing purposes.
+// NewPeer returns a peer for testing purposes.只用于测试
 func NewPeer(id discover.NodeID, name string, caps []Cap) *Peer {
+	//创建管道，无内存缓存的适用输入输出流
 	pipe, _ := net.Pipe()
 	conn := &conn{fd: pipe, transport: nil, id: id, caps: caps, name: name}
 	peer := newPeer(conn, nil)
@@ -159,10 +163,17 @@ func (p *Peer) String() string {
 }
 
 // Inbound returns true if the peer is an inbound connection
+// 如果同伴连接自己，则返回true
 func (p *Peer) Inbound() bool {
 	return p.rw.flags&inboundConn != 0
 }
 
+/**
+ * 创建同伴
+ *
+ *
+ *
+ */
 func newPeer(conn *conn, protocols []Protocol) *Peer {
 	protomap := matchProtocols(protocols, conn.caps, conn)
 	p := &Peer{
