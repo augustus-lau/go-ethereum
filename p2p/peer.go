@@ -36,14 +36,14 @@ const (
 	baseProtocolLength     = uint64(16) //协议长度
 	baseProtocolMaxMsgSize = 2 * 1024   //协议信息长度
 
-	snappyProtocolVersion = 5
+	snappyProtocolVersion = 5 //snappy是一种压缩协议
 
 	pingInterval = 15 * time.Second //心跳时间间隔
 )
 
 const (
 	// devp2p message codes
-	handshakeMsg = 0x00 //握手信息
+	handshakeMsg = 0x00 //协议握手标志
 	discMsg      = 0x01 //断开信息
 	pingMsg      = 0x02 //ping发送信息
 	pongMsg      = 0x03 //相应ping的返回信息
@@ -52,11 +52,11 @@ const (
 // protoHandshake is the RLP structure of the protocol handshake.
 // 自定义握手协议
 type protoHandshake struct {
-	Version    uint64          //版本号
-	Name       string          //同伴的名称
-	Caps       []Cap           //支持的哪些协议 及协议的版本
-	ListenPort uint64          //监听的端口
-	ID         discover.NodeID //要握手的节点ID，同伴节点的ID
+	Version    uint64          //握手协议版本号
+	Name       string          //握手协议名称
+	Caps       []Cap           //节点支持的协议，在代码中将支持的协议保存到该属性中
+	ListenPort uint64          //节点监听的端口
+	ID         discover.NodeID //节点
 
 	// Ignore additional fields (for forward compatibility).
 	Rest []rlp.RawValue `rlp:"tail"`

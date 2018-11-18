@@ -37,6 +37,7 @@ type meteredConn struct {
 	*net.TCPConn // Network connection to wrap with metering
 }
 
+/* 计量连接，如果系统不支持计量，则直接返回原始的连接。主要用于统计 */
 // newMeteredConn creates a new metered connection, also bumping the ingress or
 // egress connection meter. If the metrics system is disabled, this function
 // returns the original object.

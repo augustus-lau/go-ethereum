@@ -58,7 +58,7 @@ const (
 	sskLen = 16 // ecies.MaxSharedKeyLength(pubKey) / 2  --校验密钥是否和算法是否匹配，只有都符合条件了才能用于加密
 	sigLen = 65 // elliptic S256               椭圆加密算法签名长度
 	pubLen = 64 // 512 bit pubkey in uncompressed representation without format byte  公钥长度 2^64
-	shaLen = 32 // hash length (for nonce etc) hash值长度
+	shaLen = 32 // hash length (for nonce etc) hash值长度 nonce随机数，发送时使用。目的是防止重放攻击
 
 	authMsgLen  = sigLen + shaLen + pubLen + shaLen + 1 //授权信息的长度
 	authRespLen = pubLen + shaLen + 1                   //授权响应的长度
@@ -131,7 +131,7 @@ func (t *rlpx) close(err error) {
 }
 
 /**
- * 开始握手
+ * 加密协商通道已经建立完成，开始处理协议握手
  * @param our 发送方的握手协议
  * @param their  接收方的握手协议
  * 加密信道已经创建完毕。我们看到这里只是约定了是否使用Snappy加密然后就退出了
@@ -142,8 +142,10 @@ func (t *rlpx) doProtoHandshake(our *protoHandshake) (their *protoHandshake, err
 	// disconnects us early with a valid reason, we should return it
 	// as the error so it can be tracked elsewhere.
 	werr := make(chan error, 1)
-	// 根据协议输入输出流，状态码，数据 发送握手协议
+	// handshakeMsg = 0x00,将本机支持的协议发送给对方。告诉对方我采用的协议以及协议的版本
 	go func() { werr <- Send(t.rw, handshakeMsg, our) }()
+
+	/* 接受remote节点的 协议握手响应包，their表示remote节点支持的协议 */
 	if their, err = readProtocolHandshake(t.rw, our); err != nil {
 		<-werr // make sure the write terminates too
 		return nil, err
@@ -151,6 +153,7 @@ func (t *rlpx) doProtoHandshake(our *protoHandshake) (their *protoHandshake, err
 	if err := <-werr; err != nil {
 		return nil, fmt.Errorf("write error: %v", err)
 	}
+	/* 是否支持采用snappy压缩方式*/
 	// If the protocol version supports Snappy encoding, upgrade immediately
 	t.rw.snappy = their.Version >= snappyProtocolVersion
 
@@ -167,7 +170,7 @@ func readProtocolHandshake(rw MsgReader, our *protoHandshake) (*protoHandshake, 
 	if msg.Size > baseProtocolMaxMsgSize {
 		return nil, fmt.Errorf("message too big")
 	}
-	//如果该消息是断开节点的消息-- 返回断开原因
+	/* 接受对方消息时中断 */
 	if msg.Code == discMsg {
 		// Disconnect before protocol handshake is valid according to the
 		// spec and we send it ourself if the posthanshake checks fail.
@@ -178,11 +181,11 @@ func readProtocolHandshake(rw MsgReader, our *protoHandshake) (*protoHandshake, 
 		return nil, reason[0]
 	}
 
-	//如果不是握手消息
+	/* 如果对方返回的消息 并非协议握手标志位 */
 	if msg.Code != handshakeMsg {
 		return nil, fmt.Errorf("expected handshake, got %x", msg.Code)
 	}
-	//读取消息内容的主体
+	/* remote返回的 其支持的协议数据 */
 	var hs protoHandshake
 	if err := msg.Decode(&hs); err != nil {
 		return nil, err
@@ -193,28 +196,37 @@ func readProtocolHandshake(rw MsgReader, our *protoHandshake) (*protoHandshake, 
 	return &hs, nil
 }
 
-//加密消息握手
+// 以太坊中receiver表示接收方,initiator 表示发起方
+// 这两种模式下处理的流程是不同的。完成握手后。 生成了一个sec.可以理解为拿到了对称加密的密钥。 然后创建了一个newRLPXFrameRW帧读写器。完成加密信道的创建过程。
 // doEncHandshake runs the protocol handshake using authenticated
 // messages. the protocol handshake is the first authenticated message
 // and also verifies whether the encryption handshake 'worked' and the
 // remote side actually provided the right public key.
 func (t *rlpx) doEncHandshake(prv *ecdsa.PrivateKey, dial *discover.Node) (discover.NodeID, error) {
 	var (
-		sec secrets
+		sec secrets //握手期间采用的加密对象
 		err error
 	)
-	//如果发送消息的主题是空的，则从加密信息中获取到发送源
+	/* 如果拨号对象是空的, 以太坊中receiver表示接收方 */
 	if dial == nil {
 		sec, err = receiverEncHandshake(t.fd, prv, nil)
-	} else { //如果不为空，则验证
+	} else {
+		/* 拨号对象不为空,代表是主动发起方。以太坊中initiator 表示发起方，并返回共享秘钥  */
 		sec, err = initiatorEncHandshake(t.fd, prv, dial.ID, nil)
 	}
+
 	if err != nil {
 		return discover.NodeID{}, err
 	}
+
+	/* 开启全局锁 */
 	t.wmu.Lock()
+	/* 为当前连接，生成一个帧对象，目的是缓冲当前连接中的数据 */
 	t.rw = newRLPXFrameRW(t.fd, sec)
+	/* 关闭全局锁 */
 	t.wmu.Unlock()
+
+	/* 握手完成 */
 	return sec.RemoteID, nil
 }
 
@@ -229,24 +241,25 @@ type encHandshake struct {
 	remoteRandomPub      *ecies.PublicKey  // ecdhe-random-pubk
 }
 
+/* 只有在握手期间才使用的一种加密方式 */
 // secrets represents the connection secrets
 // which are negotiated during the encryption handshake.
 type secrets struct {
-	RemoteID              discover.NodeID
-	AES, MAC              []byte
-	EgressMAC, IngressMAC hash.Hash
-	Token                 []byte
+	RemoteID              discover.NodeID //远程地址
+	AES, MAC              []byte          //AES加密标准，mac数据
+	EgressMAC, IngressMAC hash.Hash       // 入站和出站mac
+	Token                 []byte          //token
 }
 
 // RLPx v4 handshake auth (defined in EIP-8).
 type authMsgV4 struct {
 	gotPlain bool // whether read packet had plain format.
 
-	Signature       [sigLen]byte
-	InitiatorPubkey [pubLen]byte
-	Nonce           [shaLen]byte
-	Version         uint
-
+	Signature       [sigLen]byte //签名
+	InitiatorPubkey [pubLen]byte //公钥
+	Nonce           [shaLen]byte //序列号
+	Version         uint         //版本
+	//数据
 	// Ignore additional fields (forward-compatibility)
 	Rest []rlp.RawValue `rlp:"tail"`
 }
@@ -266,14 +279,25 @@ type authRespV4 struct {
 // 所以当有一天私钥被破解。 之前的消息还是安全的
 // secrets is called after the handshake is completed.
 // It extracts the connection secrets from the handshake values.
+/**
+ * 生成双方的共享秘钥，数据传输时采用该秘钥加密数据。该共享秘钥只存在于当前的连接状态中，一旦连接断开，秘钥就删除掉。每次连接前的握手都需要生成这样一个秘钥信息。
+ * @param auth 主动发起方的 握手授权信息
+ * @param authResp 接收方回应的 响应授权信息
+ * @return 返回一个共同的对称加密秘钥，以后数据传输时，采用该秘钥加密。
+ */
 func (h *encHandshake) secrets(auth, authResp []byte) (secrets, error) {
+
+	/* 根据当前的私钥，对方的公钥，生成ECC霍夫曼树对称秘钥 */
 	ecdheSecret, err := h.randomPrivKey.GenerateShared(h.remoteRandomPub, sskLen, sskLen)
 	if err != nil {
 		return secrets{}, err
 	}
 
 	// derive base secrets from ephemeral key agreement
+	/* 对霍夫曼树秘钥进行签名 */
 	sharedSecret := crypto.Keccak256(ecdheSecret, crypto.Keccak256(h.respNonce, h.initNonce))
+
+	/* 在根据共享秘钥，ECC霍夫曼树秘钥生成 AES的签名 */
 	aesSecret := crypto.Keccak256(ecdheSecret, sharedSecret)
 	s := secrets{
 		RemoteID: h.remoteID,
@@ -289,16 +313,18 @@ func (h *encHandshake) secrets(auth, authResp []byte) (secrets, error) {
 	mac2.Write(xor(s.MAC, h.initNonce))
 	mac2.Write(authResp)
 
-	// 收到的每个包都会检查其MAC值是否满足计算的结果。如果不满足说明有问题。
+	/* 如果是主动发起方 */
 	if h.initiator {
 		s.EgressMAC, s.IngressMAC = mac1, mac2
 	} else {
+		/* 如果是接收方 */
 		s.EgressMAC, s.IngressMAC = mac2, mac1
 	}
 
 	return s, nil
 }
 
+/* 根据remote的公钥，本机的私钥生成一个共享秘钥 */
 // staticSharedSecret returns the static shared secret, the result
 // of key agreement between the local and remote static node key.
 func (h *encHandshake) staticSharedSecret(prv *ecdsa.PrivateKey) ([]byte, error) {
@@ -314,26 +340,35 @@ func (h *encHandshake) staticSharedSecret(prv *ecdsa.PrivateKey) ([]byte, error)
 // prv is the local client's private key.
 func initiatorEncHandshake(conn io.ReadWriter, prv *ecdsa.PrivateKey, remoteID discover.NodeID, token []byte) (s secrets, err error) {
 	h := &encHandshake{initiator: true, remoteID: remoteID}
+
+	/* 发起方根据本机的私钥构建authmessage（相当重要） */
 	authMsg, err := h.makeAuthMsg(prv, token)
 	if err != nil {
 		return s, err
 	}
+
+	/* 根据授权信息 生成发送的数据包 */
 	authPacket, err := sealEIP8(authMsg, h)
 	if err != nil {
 		return s, err
 	}
+
+	/* 这里可以看出，在握手阶段是只发送授权信息的验证，不发送真实数据的 */
 	if _, err = conn.Write(authPacket); err != nil {
 		return s, err
 	}
 
 	authRespMsg := new(authRespV4)
+	/* 接受对方发送过来的响应数据包 */
 	authRespPacket, err := readHandshakeMsg(authRespMsg, encAuthRespLen, prv, conn)
 	if err != nil {
 		return s, err
 	}
+	/* 校验接收到的数据的正确性 */
 	if err := h.handleAuthResp(authRespMsg); err != nil {
 		return s, err
 	}
+	/* 根据发送的数据授权包 + 接收到的响应包 生成一个共同的秘钥 */
 	return h.secrets(authPacket, authRespPacket)
 }
 
@@ -342,38 +377,50 @@ func initiatorEncHandshake(conn io.ReadWriter, prv *ecdsa.PrivateKey, remoteID d
 // 但是对于被连接的人来说，对端的公钥应该是不知道的
 // makeAuthMsg creates the initiator handshake message.
 func (h *encHandshake) makeAuthMsg(prv *ecdsa.PrivateKey, token []byte) (*authMsgV4, error) {
+
+	/* 根据reomte的Id 计算出其公钥 */
 	rpub, err := h.remoteID.Pubkey()
 	if err != nil {
 		return nil, fmt.Errorf("bad remoteID: %v", err)
 	}
+
+	/* 椭圆曲线数字签名算法（ECDSA）是使用椭圆曲线密码（ECC）对数字签名算法（DSA）的模拟 */
+	/* ECIES是校验密钥是否和算法是否匹配，只有都符合条件了才能用于加密。所以ecc的公私秘钥就是ECIES的公私秘钥 */
+	// 所以这个方法表示：根据ecc公钥，生成ecies公钥，并校验公钥是否符合ecc算法。这里之所以要校验，是因为我们的公钥是根据remoteId计算出来的。
 	h.remotePub = ecies.ImportECDSAPublic(rpub)
 
-	// 这个地方应该是直接使用了静态的共享秘密。 使用自己的私钥和对方的公钥生成的一个共享秘密
+	/* 这里随机生成一个 32字节的签名。当做请求的序列号。目的是抗重放攻击 */
 	// Generate random initiator nonce.
 	h.initNonce = make([]byte, shaLen)
 	if _, err := rand.Read(h.initNonce); err != nil {
 		return nil, err
 	}
+
+	/* 随机再生成一个椭圆的霍夫曼树的秘钥对 */
 	// Generate random keypair to for ECDH.
 	h.randomPrivKey, err = ecies.GenerateKey(rand.Reader, crypto.S256(), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// 这个地方应该是直接使用了静态的共享秘密。 使用自己的私钥和对方的公钥生成的一个共享秘密
+	// 这个地方应该是直接使用了静态的共享秘密。 使用自己的私钥和对方的公钥生成的一个共享秘密，也就是token。
+	// 这个token作为共享的对称秘钥，不需要公开，也不需要传递。是专门在网络磋商中使用的(详见ECDH)。
 	// Sign known message: static-shared-secret ^ nonce
 	token, err = h.staticSharedSecret(prv)
 	if err != nil {
 		return nil, err
 	}
+
+	/* 生成MAC */
 	signed := xor(token, h.initNonce)
 
-	//使用随机的私钥来加密这个信息。
+	/* 用计算出的ECC霍夫曼对MAC进行签名 */
 	signature, err := crypto.Sign(signed, h.randomPrivKey.ExportECDSA())
 	if err != nil {
 		return nil, err
 	}
 
+	/* 将签名，发起方的公钥，序列号封装到消息权限中 */
 	msg := new(authMsgV4)
 	copy(msg.Signature[:], signature)
 	//这里把发起者的公钥告知对方。 这样对方使用自己的私钥和这个公钥可以生成静态的共享秘密
@@ -383,19 +430,34 @@ func (h *encHandshake) makeAuthMsg(prv *ecdsa.PrivateKey, token []byte) (*authMs
 	return msg, nil
 }
 
+/* 处理接收到的授权信息时：1、获取序列号，2、校验公钥是否正确 */
 func (h *encHandshake) handleAuthResp(msg *authRespV4) (err error) {
 	h.respNonce = msg.Nonce[:]
 	h.remoteRandomPub, err = importPublicKey(msg.RandomPubkey[:])
 	return err
 }
 
+/* 当接受到remote的rpc请求后，首先需要握手，这种连接方式是采用了一种token的方式来保证连接的*/
+/* 这个方法必须在接收方接收到请求后进行调用 */
 // receiverEncHandshake negotiates a session token on conn.
 // it should be called on the listening side of the connection.
 //
 // prv is the local client's private key.
 // token is the token from a previous session with this node.
+
+/**
+ * 当接受到remote的rpc请求后，首先需要握手，这种连接方式是采用了一种token的方式来保证连接的
+ * 这个方法必须在接收方接收到请求后进行调用
+ * @param conn  接收到的连接
+ * @param prv 本机的私钥
+ * @param token 保证双方连接的token。第一次对方连接进来时为空
+ * @return secrets 双方的建立建立以来的秘钥(这个是新建的，每一个连接都有一个不一样的)
+ **/
 func receiverEncHandshake(conn io.ReadWriter, prv *ecdsa.PrivateKey, token []byte) (s secrets, err error) {
+
+	/* 生成一个epi-8标准的 授权信息 */
 	authMsg := new(authMsgV4)
+
 	authPacket, err := readHandshakeMsg(authMsg, encAuthMsgLen, prv, conn)
 	if err != nil {
 		return s, err
@@ -503,22 +565,37 @@ func (msg *authRespV4) decodePlain(input []byte) {
 	msg.Version = 4
 }
 
+/* 加密握手是的数据大小， */
 var padSpace = make([]byte, 300)
 
 // sealEIP8方法，这个方法是一个组包方法，对msg进行rlp的编码。 填充一些数据。
 // 然后使用对方的公钥把数据进行加密。 这意味着只有对方的私钥才能解密这段信息
 func sealEIP8(msg interface{}, h *encHandshake) ([]byte, error) {
+
+	/* 用于保存授权信息 */
 	buf := new(bytes.Buffer)
+
+	/* 授权信息 的RLP 编码 */
 	if err := rlp.Encode(buf, msg); err != nil {
 		return nil, err
 	}
 	// pad with random amount of data. the amount needs to be at least 100 bytes to make
 	// the message distinguishable from pre-EIP-8 handshakes.
+	/* padSpace的长度是300，这里随机产生一个大于100的数n，然后获取padSpace 中0-n的数据动态字节数组 */
+	/* 这里之所以是必须要求大于100，主要的原因是要保证 与之前的握手 的数据是可以分辨的。如果小于100，则可能无法分辨上次与这次的数据？？这是什么原因 */
+	/* 这个叫做拼接空间，这么做是为什么??? */
 	pad := padSpace[:mrand.Intn(len(padSpace)-100)+100]
+
+	/* 然后将要传送的数据 写到动态字节数组中 */
 	buf.Write(pad)
+
+	/* 保存头的头+授权信息的长度 */
 	prefix := make([]byte, 2)
+
+	/* 将数据长度 + ecies的头长度 放入到prefix中 */
 	binary.BigEndian.PutUint16(prefix, uint16(buf.Len()+eciesOverhead))
 
+	/* 采用remote的公钥 对授权信息加密。这里可以看出，握手阶段是不发送数据的 */
 	enc, err := ecies.Encrypt(rand.Reader, h.remotePub, buf.Bytes(), nil, prefix)
 	return append(prefix, enc...), err
 }
@@ -527,34 +604,59 @@ type plainDecoder interface {
 	decodePlain([]byte)
 }
 
-// readHandshakeMsg这个方法会从两个地方调用。
-// 一个是在initiatorEncHandshake。
-// 一个就是在receiverEncHandshake。
-// 这个方法比较简单。 首先用一种格式尝试解码。如果不行就换另外一种。应该是一种兼容性的设置。
-// 基本上就是使用自己的私钥进行解码然后调用rlp解码成结构体。
-// 结构体的描述就是下面的authRespV4,里面最重要的就是对端的随机公钥。
-// 双方通过自己的私钥和对端的随机公钥可以得到一样的共享秘密。 而这个共享秘密是第三方拿不到的
+/**
+ * 从remote的连接中 读取出 rpc握手的授权信息
+ *
+ * readHandshakeMsg这个方法会从两个地方调用。
+ * 一个是在initiatorEncHandshake。
+ * 一个就是在receiverEncHandshake。
+ * 这个方法比较简单。 首先用一种格式尝试解码。如果不行就换另外一种。应该是一种兼容性的设置。
+ * 基本上就是使用自己的私钥进行解码然后调用rlp解码成结构体。
+ * 结构体的描述就是下面的authRespV4,里面最重要的就是对端的随机公钥。
+ * 双方通过自己的私钥和对端的随机公钥可以得到一样的共享秘密。 而这个共享秘密是第三方拿不到的
+ * @param msg  要生成的授权信息接受对象
+ * @param plainSize 响应包的数据理论长度
+ * @param prv 本机的私钥
+ * @return r remote的连接
+ **/
 func readHandshakeMsg(msg plainDecoder, plainSize int, prv *ecdsa.PrivateKey, r io.Reader) ([]byte, error) {
+
+	/* 保存authRespV4的字节码  */
 	buf := make([]byte, plainSize)
+
+	/* 从流中读取出authRespV4 */
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return buf, err
 	}
+
+	/* 握手阶段采用ECIES 秘钥 */
 	// Attempt decoding pre-EIP-8 "plain" format.
 	key := ecies.ImportECDSA(prv)
+
+	/* 用上述产生的私钥，解密authRespV4 */
 	if dec, err := key.Decrypt(buf, nil, nil); err == nil {
 		msg.decodePlain(dec)
 		return buf, nil
 	}
+
+	/* 读取出数据的总长度 */
 	// Could be EIP-8 format, try that.
 	prefix := buf[:2]
+
+	/* 按照16进制转为无符号int */
 	size := binary.BigEndian.Uint16(prefix)
+	/* 如果这个长度 小于理论的长度。校验失败 */
 	if size < uint16(plainSize) {
 		return buf, fmt.Errorf("size underflow, need at least %d bytes", plainSize)
 	}
+
+	/* 把数据全部读取到buf中 */
 	buf = append(buf, make([]byte, size-uint16(plainSize)+2)...)
 	if _, err := io.ReadFull(r, buf[plainSize:]); err != nil {
 		return buf, err
 	}
+
+	/* 对数据进行非对称的解密 */
 	dec, err := key.Decrypt(buf[2:], nil, prefix)
 	if err != nil {
 		return buf, err
@@ -562,6 +664,8 @@ func readHandshakeMsg(msg plainDecoder, plainSize int, prv *ecdsa.PrivateKey, r 
 	// Can't use rlp.DecodeBytes here because it rejects
 	// trailing data (forward-compatibility).
 	s := rlp.NewStream(bytes.NewReader(dec), 0)
+
+	/* 返回解密后的字节数组 */
 	return buf, s.Decode(msg)
 }
 
@@ -627,10 +731,13 @@ type rlpxFrameRW struct {
 }
 
 func newRLPXFrameRW(conn io.ReadWriter, s secrets) *rlpxFrameRW {
+
+	/* 判断mac是否加密 */
 	macc, err := aes.NewCipher(s.MAC)
 	if err != nil {
 		panic("invalid MAC secret: " + err.Error())
 	}
+	/* 加密方式是否为aes */
 	encc, err := aes.NewCipher(s.AES)
 	if err != nil {
 		panic("invalid AES secret: " + err.Error())
@@ -638,6 +745,8 @@ func newRLPXFrameRW(conn io.ReadWriter, s secrets) *rlpxFrameRW {
 	// we use an all-zeroes IV for AES because the key used
 	// for encryption is ephemeral.
 	iv := make([]byte, encc.BlockSize())
+
+	/* 根据加密方式 生成帧对象 */
 	return &rlpxFrameRW{
 		conn:       conn,
 		enc:        cipher.NewCTR(encc, iv),
